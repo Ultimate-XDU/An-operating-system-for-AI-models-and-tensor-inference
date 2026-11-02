@@ -51,6 +51,13 @@ impl<'a> SafeTensorsWeights<'a> {
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }
+
+    /// Tensor names in lexicographic order.
+    ///
+    /// The order matches the index built at parse time. Payload bytes are not touched.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.index.keys().map(String::as_str)
+    }
 }
 
 fn tensor_info(view: &StView<'_>) -> Result<TensorInfo, WeightError> {
@@ -148,6 +155,10 @@ mod tests {
         let weights = SafeTensorsWeights::parse(&file).unwrap();
         assert_eq!(weights.len(), 4);
         assert!(!weights.is_empty());
+        assert_eq!(
+            weights.names().collect::<Vec<_>>(),
+            vec!["bias", "w_bf16", "w_f16", "w_f32"]
+        );
 
         let f32_info = weights.tensor_info("w_f32").unwrap();
         assert_eq!(f32_info.dtype, DType::F32);

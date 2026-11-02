@@ -4,6 +4,17 @@ version = "0.1.0"
 edition = "2021"
 description = "WeightLoaderCore: format-agnostic zero-copy weight loading"
 
+[features]
+# Read-only mmap of a `.safetensors` file (`std` + `memmap2`).
+# Off by default so the library stays `no_std` + `alloc`.
+host = ["dep:memmap2"]
+
 [dependencies]
 # `std` off: no serde/std, serde_json/std, or tempfile. 0.8 is no_std + alloc.
 safetensors = { version = "0.8", default-features = false }
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# Unit tests compile the host module via `cfg(test)` without enabling `host`
+# for dependents. The runtime opts into `host` for non-test builds.
+memmap2 = "0.9"
