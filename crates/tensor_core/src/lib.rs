@@ -11,18 +11,29 @@
 //! [`HEAD_DIM_QWEN25_1_5B`] (`128`). Pairing is NeoX / half-rotate
 //! (HF Qwen2 `rotate_half`: lane `i` with lane `i + head_dim/2`);
 //! see the `rope` module.
+//! [`gqa_attn_f32`] is one query position against cached K/V: f32 dots,
+//! `1/sqrt(head_dim)`, serial softmax, then the value mix. Qwen2.5-1.5B
+//! passes 12 query heads and 2 KV heads ([`NUM_ATTENTION_HEADS_QWEN25_1_5B`],
+//! [`NUM_KV_HEADS_QWEN25_1_5B`]). See the `gqa` module.
 //!
 //! Fingerprint intent (the run hash is later): `quant_or_dtype=bf16`
 //! ([`QUANT_OR_DTYPE`]), `acc_path=bf16_w_fp32_acc` ([`ACC_PATH`]).
 //! RMSNorm's `Σx²` is the exact-sensitive reduction on that path: one thread,
 //! left to right, f32. Qwen2.5 passes [`RMS_NORM_EPS_QWEN25`] (`1e-6`).
+//! GQA stays on f32 activations (no second dtype). Its exact-sensitive steps
+//! are the serial dot, the f32 scale, and the serial max / `expf` / sum / divide.
 #![cfg_attr(not(test), no_std)]
 
 mod bf16;
+mod gqa;
 mod rope;
 pub use bf16::{
     bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32, Bf16OpError,
     ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
+};
+pub use gqa::{
+    attn_scale_f32, gqa_attn_f32, GqaError, GqaMask, GqaShape, GQA_Q_PER_KV_QWEN25_1_5B,
+    NUM_ATTENTION_HEADS_QWEN25_1_5B, NUM_KV_HEADS_QWEN25_1_5B,
 };
 pub use rope::{
     rope_f32, rope_f32_inplace, rope_inv_freqs, RopeError, HEAD_DIM_QWEN25_1_5B, ROPE_THETA_QWEN25,
