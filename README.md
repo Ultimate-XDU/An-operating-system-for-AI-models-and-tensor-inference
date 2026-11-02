@@ -59,7 +59,15 @@ Fingerprint intent, hash later: `quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc
 
 Pairing is NeoX / half-rotate, the same layout as HF Qwen2 `rotate_half` and llama.cpp `LLAMA_ROPE_TYPE_NEOX`. With `h = head_dim / 2`, lane `i` rotates with lane `i + h`: `y[i] = x[i] cos - x[i+h] sin`, `y[i+h] = x[i+h] cos + x[i] sin` (multiply then add or subtract, no `mul_add`). The same angle is used on both halves. Adjacent even/odd lanes are not a second entry point.
 
-`inv_freq[i] = 1 / powf(theta, (2i) / head_dim)`, then `angle = f32(position) * inv_freq[i]` and libm `cosf` / `sinf`. Each pair is independent (no iterative `freq *= theta**(-2/d)`). Position 0 is the identity on finite inputs. An odd `head_dim`, an empty buffer, or a length that is not a positive multiple of `head_dim` returns `Err` and does not write. GQA scores, KV cache, and SwiGLU are not in this step. The smoke line is still `[1, 2, 3, 0]`.
+`inv_freq[i] = 1 / powf(theta, (2i) / head_dim)`, then `angle = f32(position) * inv_freq[i]` and libm `cosf` / `sinf`. Each pair is independent (no iterative `freq *= theta**(-2/d)`). Position 0 is the identity on finite inputs. An odd `head_dim`, an empty buffer, or a length that is not a positive multiple of `head_dim` returns `Err` and does not write. The smoke line is still `[1, 2, 3, 0]`.
+
+## GQA attention
+
+`tensor_core::gqa_attn_f32` is one query position against cached K and V. Activations stay f32 (Q, K, V, scores, probabilities, output). There is no weight byte view: Q/K/V projections stay on `gemv_bf16` later. Counts sit on `GqaShape`. Qwen2.5-1.5B passes `NUM_ATTENTION_HEADS_QWEN25_1_5B` (12), `NUM_KV_HEADS_QWEN25_1_5B` (2), and `HEAD_DIM_QWEN25_1_5B` (128), so `GQA_Q_PER_KV_QWEN25_1_5B` is 6. Query head `h` reads KV head `h / 6` (HF `repeat_kv`, contiguous groups).
+
+Layout, no batch axis: Q and Y are `[num_q_heads, head_dim]`. K and V are `[num_kv_heads, seq_len, head_dim]`. `scale = 1 / sqrtf(head_dim)` once (`attn_scale_f32`), then each score is `dot * scale` after a left-to-right dot (multiply, then add; not `mul_add`). Softmax is one thread over the visible keys: max starts at key 0 (`>`), `expf(score - max)`, left-to-right sum, then `e / sum` (division, not a reciprocal multiply). The value mix is the same left-to-right order. `probs` is scratch of length `seq_len`; on success it holds the last query head.
+
+`GqaMask::Full` scores the whole cache (decode that already stored only the legal prefix). `GqaMask::Causal { query_pos }` drops key index `t > query_pos` before the dot, so those V slots are not read. `query_pos >= seq_len - 1` keeps every key. A zero count, a query-head count that is not a multiple of the KV-head count, or a bad buffer length returns `Err` and does not write. KV-cache allocation, SwiGLU, and a multi-query prefill kernel are not in this step. The smoke line is still `[1, 2, 3, 0]`.
 
 ## Feature flags
 
