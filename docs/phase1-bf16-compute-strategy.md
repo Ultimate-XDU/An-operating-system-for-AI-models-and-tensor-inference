@@ -10,6 +10,8 @@
 
 **阅读约定**：【已知事实】可在协议/布局/代码核对；【推测/建议】不得当协议条款。
 
+**勘误（2026-11-02）**：§2 表中 RoPE 原写「偶奇维交错」不准确；Qwen2.5-1.5B-Instruct 应对齐 **NeoX half-rotate**（已合入 main @ `7db6f713` / PR #9）。相邻 interleaved **不是** Phase1 合法配对。
+
 ---
 
 ## 0. 材料核对（背景 → 事实）
@@ -49,7 +51,7 @@
 |----|------|----------------|
 | 1 | **embed gather** | 一切 token 路径起点；错行/错 dtype 升精 → 全序列必偏 |
 | 2 | **RMSNorm** | 每层×2 + final；`Σx²` 归约顺序与 `eps` 是经典 exact 杀手 |
-| 3 | **RoPE** | Q/K 旋转；`theta`、freq 表、偶奇维交错须与参考逐位同构，否则后续 attn 全漂 |
+| 3 | **RoPE** | Q/K 旋转；**配对钉死 HF Qwen2 / llama.cpp `LLAMA_ROPE_TYPE_NEOX` half-rotate**（lane `i` 与 `i+head_dim/2`，非相邻 even/odd interleaved）；`theta`、freq 表与 half 切分须与参考逐位同构，否则后续 attn 全漂 |
 | 4 | **GQA attn**（含 Q/K/V/O 投影+bias 规则、KV 读写、score、softmax、×V、KV 头复制） | 最长依赖链；softmax 与 matmul 归约顺序、prefill/decode 是否同核，直接决定 token |
 | 5 | **SwiGLU**（SiLU(gate)⊙up → down） | `silu` 近零数值与三个 GEMV 的累加顺序；与 attn 并列的第二大漂源 |
 | 6 | **tied lm_head** | 用 embed 矩阵做 vocab 维投影；vocab=151936，最大单次 GEMV；greedy 平局规则已在 `greedy_token`（较低 index）须与参考一致 |
