@@ -39,6 +39,14 @@ MYOS_WEIGHTS=path/to/file.safetensors cargo run -p myos_runtime
 
 The runtime smoke above is unchanged: it still loads `MmapWeights` via `cycle_fixture`, not a SafeTensors file.
 
+## BF16 numeric path
+
+Phase1 main-track weights stay BF16 byte views. `tensor_core::gemv_bf16` is a row-major little-endian BF16 matrix times an f32 vector, accumulated in f32. `tensor_core::embed_gather_bf16` copies one `[vocab, hidden]` row into an f32 vector. Both decode BF16 (the top 16 bits of f32) inside the op. They do not call `load_f32_tensor`, and `load_f32_tensor` stays F32-only.
+
+Fingerprint intent, hash later: `quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc`.
+
+`gemv_f32` and the `cycle_fixture` smoke stay on the f32 fixture. `cargo run -p myos_runtime` is still `[1, 2, 3, 0]`. Unit tests build tiny BF16 tables in process; they do not download Qwen.
+
 ## Feature flags
 
 `weight_loader` is `no_std` + `alloc` by default. `tensor_core` and `model_core` depend on that default and do not enable host I/O.
