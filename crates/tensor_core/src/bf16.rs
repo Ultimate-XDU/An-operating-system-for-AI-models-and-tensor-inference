@@ -3,10 +3,15 @@
 //! Phase1 main-track weights stay little-endian BF16 views. These ops decode
 //! each element to f32 inside the loop and accumulate in f32. They do not
 //! upcast a whole matrix first, and they do not call `load_f32_tensor`.
+//! Activations between ops stay f32, including RMSNorm input and output.
 //!
 //! Fingerprint intent (the run hash comes later):
 //! - `quant_or_dtype` = [`QUANT_OR_DTYPE`] (`bf16`)
 //! - `acc_path` = [`ACC_PATH`] (`bf16_w_fp32_acc`)
+//!
+//! RMSNorm does not open a second accumulate path. `Σx²` is a single-thread
+//! left-to-right f32 sum (multiply, then add). Gamma is BF16 on the main
+//! track ([`rmsnorm_bf16_weight`]) or f32 on the reference ([`rmsnorm_f32`]).
 
 use core::fmt;
 
@@ -15,15 +20,25 @@ pub const QUANT_OR_DTYPE: &str = "bf16";
 
 /// Fingerprint field `acc_path`.
 ///
-/// Storage is BF16. The dot product decodes each weight to f32 and adds in f32.
+/// Storage is BF16. GEMV decodes each weight to f32 and adds in f32.
+/// RMSNorm keeps that contract: BF16 gamma, f32 math, f32 activations.
+/// Its exact-sensitive step is the serial `Σx²` reduction, not a second dtype.
 pub const ACC_PATH: &str = "bf16_w_fp32_acc";
 
-/// Shape or index failure from a BF16 op.
+/// Qwen2.5 `rms_norm_eps` (`config.json`).
+///
+/// [`rmsnorm_f32`] and [`rmsnorm_bf16_weight`] take `eps` as an argument so a
+/// test can move it. The Qwen2.5 track passes this value (`1e-6`).
+/// See `docs/qwen25-1.5b-instruct-layout.md`.
+pub const RMS_NORM_EPS_QWEN25: f32 = 1e-6;
+
+/// Shape or index failure from a tensor op.
 ///
 /// On `Err`, output slices passed by the caller are left unchanged.
+/// [`rmsnorm_f32`] uses [`Bf16OpError::Shape`] for a length mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bf16OpError {
-    /// Rank, width, or byte length does not match the declared shape.
+    /// Rank, width, byte length, or RMSNorm vector length does not match.
     Shape,
     /// `token_id` is outside `[0, vocab)`.
     TokenOutOfBounds,
@@ -34,7 +49,7 @@ pub enum Bf16OpError {
 impl fmt::Display for Bf16OpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Bf16OpError::Shape => write!(f, "bf16 op shape does not match the buffers"),
+            Bf16OpError::Shape => write!(f, "shape does not match the buffers"),
             Bf16OpError::TokenOutOfBounds => write!(f, "token id is out of bounds"),
             Bf16OpError::RowOutOfBounds => write!(f, "bf16 row is out of bounds"),
         }
@@ -129,6 +144,91 @@ pub fn embed_gather_bf16(
     Ok(())
 }
 
+/// `y[i] = weight[i] * (x[i] * inv_rms)` with an f32 gamma.
+///
+/// `inv_rms = 1 / sqrt(Σx² / n + eps)`, with IEEE-754 `sqrtf` (not an
+/// approximate rsqrt). `Σx²` is a single-thread, left-to-right f32 sum of
+/// `x[j] * x[j]` (multiply, then add; not `f32::mul_add`).
+/// `n == x.len()`. Empty `x`, or any slice whose length is not `n`, returns
+/// [`Bf16OpError::Shape`] and leaves `y` unchanged.
+///
+/// Qwen2.5 passes [`RMS_NORM_EPS_QWEN25`]. `eps = 0` and an all-zero `x` is
+/// `0 * inf` and yields NaN; the Qwen default keeps that vector at zero.
+pub fn rmsnorm_f32(y: &mut [f32], weight: &[f32], x: &[f32], eps: f32) -> Result<(), Bf16OpError> {
+    let n = rms_len(y, x)?;
+    if weight.len() != n {
+        return Err(Bf16OpError::Shape);
+    }
+    let inv_rms = inv_rms_serial(x, eps);
+    for i in 0..n {
+        y[i] = weight[i] * (x[i] * inv_rms);
+    }
+    Ok(())
+}
+
+/// `y[i] = bf16_to_f32(weight[i]) * (x[i] * inv_rms)`.
+///
+/// `x` and `y` are f32. `weight` is little-endian BF16 gamma, `2 * n` bytes,
+/// decoded per element inside the loop. The vector is not copied to an f32
+/// allocation. The sum of squares matches [`rmsnorm_f32`]: one thread, left
+/// to right, f32. Same fingerprint as GEMV ([`ACC_PATH`]).
+///
+/// On `Err`, `y` is unchanged. A length mismatch (including an odd byte
+/// length, a short gamma, or `n == 0`) is [`Bf16OpError::Shape`].
+pub fn rmsnorm_bf16_weight(
+    y: &mut [f32],
+    weight: &[u8],
+    x: &[f32],
+    eps: f32,
+) -> Result<(), Bf16OpError> {
+    let n = rms_len(y, x)?;
+    let nbytes = n.checked_mul(2).ok_or(Bf16OpError::Shape)?;
+    if weight.len() != nbytes {
+        return Err(Bf16OpError::Shape);
+    }
+    let inv_rms = inv_rms_serial(x, eps);
+    for i in 0..n {
+        let mut le = [0u8; 2];
+        le.copy_from_slice(&weight[i * 2..i * 2 + 2]);
+        y[i] = bf16_le_to_f32(le) * (x[i] * inv_rms);
+    }
+    Ok(())
+}
+
+/// Reject an empty vector. `y` must be the same length as `x`.
+fn rms_len(y: &[f32], x: &[f32]) -> Result<usize, Bf16OpError> {
+    if x.is_empty() || y.len() != x.len() {
+        return Err(Bf16OpError::Shape);
+    }
+    Ok(x.len())
+}
+
+/// `1 / sqrt(mean(x²) + eps)`, mean taken after a serial sum.
+///
+/// `sqrt` is IEEE-754 `sqrtf`, not an approximate rsqrt.
+/// `x.len() as f32` is exact for lengths up to `2^24` (Qwen2.5 hidden size is 1536).
+fn inv_rms_serial(x: &[f32], eps: f32) -> f32 {
+    let mut sum_sq = 0.0f32;
+    for &value in x {
+        sum_sq += value * value;
+    }
+    let mean = sum_sq / (x.len() as f32);
+    1.0 / sqrt_f32(mean + eps)
+}
+
+// `f32::sqrt` lives in `std`. This crate is `no_std` outside tests, so call
+// libm `sqrtf`: correctly rounded IEEE-754 sqrt, not an approximate rsqrt.
+#[cfg_attr(unix, link(name = "m"))]
+extern "C" {
+    fn sqrtf(x: f32) -> f32;
+}
+
+fn sqrt_f32(x: f32) -> f32 {
+    // SAFETY: sqrtf is defined for every f32 bit pattern, including NaN,
+    // infinities, and negatives (those return NaN).
+    unsafe { sqrtf(x) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +253,9 @@ mod tests {
     fn fingerprint_intent_names_bf16_f32_acc() {
         assert_eq!(QUANT_OR_DTYPE, "bf16");
         assert_eq!(ACC_PATH, "bf16_w_fp32_acc");
+        // RMSNorm stays on that path. Qwen2.5's eps is the documented default.
+        assert_eq!(RMS_NORM_EPS_QWEN25, 1e-6f32);
+        assert_eq!(RMS_NORM_EPS_QWEN25.to_bits(), 0x3586_37BD);
     }
 
     #[test]
@@ -284,6 +387,139 @@ mod tests {
         let mut wide = [0.0, 0.0];
         assert_eq!(
             embed_gather_bf16(&mut wide, &table, &shape, 0),
+            Err(Bf16OpError::Shape)
+        );
+    }
+
+    #[test]
+    fn rmsnorm_matches_hand_values() {
+        // n = 4, x = [8, 0, 0, 0]. Σx² = 64, mean = 16, inv_rms = 1/4.
+        // y = w * (x * 1/4) = [3, 0, 0, 0] for w = [1.5, 4, -2, 0.5].
+        let x = [8.0f32, 0.0, 0.0, 0.0];
+        let w = [1.5f32, 4.0, -2.0, 0.5];
+        let mut y = [0.0; 4];
+        rmsnorm_f32(&mut y, &w, &x, 0.0).unwrap();
+        assert_eq!(y, [3.0, 0.0, 0.0, 0.0]);
+
+        let mut y_bf16 = [0.0; 4];
+        rmsnorm_bf16_weight(&mut y_bf16, &pack(&w), &x, 0.0).unwrap();
+        assert_eq!(y_bf16, y);
+
+        // Constant magnitude: |x| = 2, n = 2, mean = 4, inv_rms = 1/2.
+        // Sign of x is kept. y = [3 * 1, 4 * -1].
+        let x_sign = [2.0f32, -2.0];
+        let w_sign = [3.0f32, 4.0];
+        let mut y_sign = [0.0; 2];
+        rmsnorm_f32(&mut y_sign, &w_sign, &x_sign, 0.0).unwrap();
+        assert_eq!(y_sign, [3.0, -4.0]);
+        let mut y_sign_bf16 = [0.0; 2];
+        rmsnorm_bf16_weight(&mut y_sign_bf16, &pack(&w_sign), &x_sign, 0.0).unwrap();
+        assert_eq!(y_sign_bf16, y_sign);
+    }
+
+    #[test]
+    fn rmsnorm_serial_sum_squares_is_left_to_right() {
+        // squares = [2^24, 1, 1, 1]. Left to right the 1s fall below the ulp
+        // of 2^24, so Σx² stays 16777216. Ones-first would be 16777220 and
+        // would not yield y[0] == 2. n = 4, mean = 2^22, inv_rms = 2^-11.
+        let big = 4096.0f32; // 2^12; square is 2^24
+        let x = [big, 1.0, 1.0, 1.0];
+        let w = [1.0f32, 1.0, 1.0, 1.0];
+        let mut y = [0.0; 4];
+        rmsnorm_f32(&mut y, &w, &x, 0.0).unwrap();
+        let small = f32::from_bits(0x3a00_0000); // 2^-11
+        assert_eq!(y, [2.0, small, small, small]);
+
+        let mut y_bf16 = [0.0; 4];
+        rmsnorm_bf16_weight(&mut y_bf16, &pack(&w), &x, 0.0).unwrap();
+        assert_eq!(y_bf16, y);
+    }
+
+    #[test]
+    fn rmsnorm_eps_qwen25_scales_and_zero_stays_zero() {
+        let x = [1.0f32, 1.0, 1.0, 1.0];
+        let w = [1.0f32, 1.0, 1.0, 1.0];
+        let packed = pack(&w);
+        let mut y_zero_eps = [0.0; 4];
+        let mut y_eps = [0.0; 4];
+        rmsnorm_f32(&mut y_zero_eps, &w, &x, 0.0).unwrap();
+        rmsnorm_bf16_weight(&mut y_eps, &packed, &x, RMS_NORM_EPS_QWEN25).unwrap();
+        assert_eq!(y_zero_eps, [1.0, 1.0, 1.0, 1.0]);
+        // 1/sqrt(1 + 1e-6) in f32. Locked so a mean/eps reorder fails.
+        let scaled = f32::from_bits(0x3f7f_fff8);
+        assert_eq!(y_eps, [scaled, scaled, scaled, scaled]);
+        assert!(scaled < 1.0);
+
+        let zeros = [0.0f32, 0.0];
+        let w0 = [3.0f32, -1.0];
+        let mut y_default = [7.0; 2];
+        rmsnorm_bf16_weight(&mut y_default, &pack(&w0), &zeros, RMS_NORM_EPS_QWEN25).unwrap();
+        assert_eq!(y_default, [0.0, 0.0]);
+
+        let mut y_nan = [7.0; 2];
+        rmsnorm_f32(&mut y_nan, &w0, &zeros, 0.0).unwrap();
+        assert!(y_nan[0].is_nan() && y_nan[1].is_nan());
+    }
+
+    #[test]
+    fn rmsnorm_bf16_weight_reads_little_endian() {
+        // n = 1, x = 1, eps = 0 → y = gamma. LE [00, 40] is f32 2.0.
+        let mut y = [0.0];
+        rmsnorm_bf16_weight(&mut y, &[0x00, 0x40], &[1.0], 0.0).unwrap();
+        assert_eq!(y, [2.0]);
+
+        rmsnorm_bf16_weight(&mut y, &[0x40, 0x00], &[1.0], 0.0).unwrap();
+        assert_eq!(y[0], f32::from_bits(0x0040_0000));
+        assert_ne!(y[0], 2.0);
+    }
+
+    #[test]
+    fn rmsnorm_rejects_length_mismatch() {
+        let x = [1.0f32, 2.0];
+        let w = [1.0f32, 1.0];
+        let packed = pack(&w);
+        let mut y = [7.0, 8.0];
+
+        assert_eq!(
+            rmsnorm_f32(&mut y, &w, &x[..1], 0.0),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(y, [7.0, 8.0]);
+
+        let mut y_short = [7.0];
+        assert_eq!(
+            rmsnorm_f32(&mut y_short, &w, &x, 0.0),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(y_short, [7.0]);
+        assert_eq!(
+            rmsnorm_f32(&mut y, &w[..1], &x, 0.0),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(y, [7.0, 8.0]);
+
+        assert_eq!(
+            rmsnorm_bf16_weight(&mut y, &packed[..2], &x, 0.0),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(
+            rmsnorm_bf16_weight(&mut y, &[0x00, 0x40, 0x00], &x, 0.0),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(
+            rmsnorm_bf16_weight(&mut y_short, &packed, &x, 0.0),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(y, [7.0, 8.0]);
+        assert_eq!(y_short, [7.0]);
+
+        let mut empty = [];
+        assert_eq!(
+            rmsnorm_f32(&mut empty, &[], &[], RMS_NORM_EPS_QWEN25),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(
+            rmsnorm_bf16_weight(&mut empty, &[], &[], RMS_NORM_EPS_QWEN25),
             Err(Bf16OpError::Shape)
         );
     }

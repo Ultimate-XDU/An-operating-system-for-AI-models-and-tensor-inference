@@ -1,17 +1,21 @@
 //! TensorCore — Phase 1 CPU ops.
 //!
 //! [`gemv_f32`] is the f32 fixture path used by the cycle smoke.
-//! [`gemv_bf16`] and [`embed_gather_bf16`] are the main-track numeric path:
-//! little-endian BF16 weight bytes, decoded to f32 inside the op, accumulated
-//! in f32. The whole matrix is not loaded as f32.
+//! [`gemv_bf16`], [`embed_gather_bf16`], and [`rmsnorm_bf16_weight`] are the
+//! main-track numeric path: little-endian BF16 weight bytes, decoded to f32
+//! inside the op. Activations stay f32. The whole matrix is not loaded as f32.
+//! [`rmsnorm_f32`] is the f32-gamma reference for the same reduction.
 //!
 //! Fingerprint intent (the run hash is later): `quant_or_dtype=bf16`
 //! ([`QUANT_OR_DTYPE`]), `acc_path=bf16_w_fp32_acc` ([`ACC_PATH`]).
+//! RMSNorm's `Σx²` is the exact-sensitive reduction on that path: one thread,
+//! left to right, f32. Qwen2.5 passes [`RMS_NORM_EPS_QWEN25`] (`1e-6`).
 #![cfg_attr(not(test), no_std)]
 
 mod bf16;
 pub use bf16::{
-    bf16_le_to_f32, embed_gather_bf16, gemv_bf16, Bf16OpError, ACC_PATH, QUANT_OR_DTYPE,
+    bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32, Bf16OpError,
+    ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
 };
 
 /// y[i] = sum_j W[i,j] * x[j]
