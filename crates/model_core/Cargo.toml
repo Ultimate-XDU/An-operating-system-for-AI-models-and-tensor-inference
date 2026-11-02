@@ -1,0 +1,9 @@
+[package]
+name = "model_core"
+version = "0.1.0"
+edition = "2021"
+description = "ModelCore: type-safe model trait"
+
+[dependencies]
+tensor_core = { path = "../tensor_core" }
+weight_loader = { path = "../weight_loader" }

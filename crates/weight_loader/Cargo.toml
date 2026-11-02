@@ -1,0 +1,7 @@
+[package]
+name = "weight_loader"
+version = "0.1.0"
+edition = "2021"
+description = "WeightLoaderCore: format-agnostic zero-copy weight loading"
+
+[dependencies]

@@ -1,0 +1,14 @@
+[package]
+name = "myos_runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal host-side inference loop (Phase 1)"
+
+[[bin]]
+name = "myos"
+path = "src/main.rs"
+
+[dependencies]
+model_core = { path = "../model_core" }
+tensor_core = { path = "../tensor_core" }
+weight_loader = { path = "../weight_loader" }

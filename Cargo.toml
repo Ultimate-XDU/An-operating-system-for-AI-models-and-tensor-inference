@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/weight_loader",
+  "crates/tensor_core",
+  "crates/model_core",
+  "crates/runtime",
+]
