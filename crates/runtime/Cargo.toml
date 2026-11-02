@@ -10,3 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 model_core = { path = "../model_core" }
+# Host-only file map. `model_core` keeps the default `no_std` weight_loader.
+weight_loader = { path = "../weight_loader", features = ["host"] }
+
+[dev-dependencies]
+safetensors = { version = "0.8", default-features = false }

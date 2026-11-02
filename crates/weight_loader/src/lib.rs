@@ -4,12 +4,22 @@
 //! [`SafeTensorsWeights`] parses a SafeTensors byte buffer with the official
 //! `safetensors` crate (`std` feature off) and returns `&[u8]` views into that
 //! buffer. GGUF stays out of this crate for now.
-#![cfg_attr(not(test), no_std)]
+//!
+//! The default build is `no_std` + `alloc`. Feature `host` (and this crate's
+//! own tests) add `SafeTensorsMmap`, which maps a `.safetensors` file with
+//! `memmap2` and lends those pages to [`SafeTensorsWeights`]. Tensor payloads
+//! are not copied.
+#![cfg_attr(all(not(test), not(feature = "host")), no_std)]
 
 extern crate alloc;
 
 mod safe_tensors;
 pub use safe_tensors::SafeTensorsWeights;
+
+#[cfg(any(test, feature = "host"))]
+mod mmap;
+#[cfg(any(test, feature = "host"))]
+pub use mmap::{SafeTensorsMmap, WeightFileError};
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -114,6 +124,7 @@ struct Entry {
 ///
 /// The buffer is the P0 stand-in for an mmap: callers borrow tensor bytes, they do not clone them.
 /// `insert_f32` writes native-endian f32 bytes. This is an in-memory fixture format, not SafeTensors.
+/// A real file map is `SafeTensorsMmap` when feature `host` is enabled.
 #[derive(Debug, Default)]
 pub struct MmapWeights {
     buf: Vec<u8>,
