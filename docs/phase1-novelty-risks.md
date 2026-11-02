@@ -10,11 +10,13 @@
 
 **阅读约定**：凡标 **【已知事实】** 均可在协议/代码/README 中核对；凡标 **【推测/建议】** 为论证或工程建议，**不得当作协议条款**。
 
+**勘误（2026-11-02，SafeTensors 落地后）**：下文凡称「`Cargo.lock` 无第三方 / workspace 无外部 crate」均指本文起草时快照，**不是当前树**。当前 `Cargo.lock` 含 `safetensors`（`weight_loader` 默认依赖，`default-features = false`）及可选 `memmap2`（`host` feature；`myos_runtime` 启用）。`tensor_core` 与 `model_core` 仍无外部 crate。分析与建议未改写。
+
 ---
 
 ## 0. 执行摘要（给 OSdeveloper 同步）
 
-1. **现状**：Phase1 评测框架已冻结（v0.1）；实现仍为 stub（`WeightMap` / `MinimalistModel` trait、`gemv_f32`、runtime println）。workspace crates **当前无外部 crate 依赖**（`Cargo.lock` 可核）。
+1. **现状**：Phase1 评测框架已冻结（v0.1）；实现仍为 stub（`WeightMap` / `MinimalistModel` trait、`gemv_f32`、runtime println）。workspace 起草时无外部 crate；**现 `Cargo.lock` 有 `safetensors`，以及可选 `memmap2`（经 `host`）**（见文首勘误）。
 2. **可辩护新颖点（收窄后）**：不是「又一个 LLM runtime」，而是（a）**对打协议先于算子**的可复现竞技场；（b）**core crates 的 no_std + 零外部依赖姿态**为后续 Unikernel/最小环留接口债可控的底座；（c）**双赛道分表 + exact 前置**把正确性与吞吐叙事拆开。相对 llama.cpp / candle / burn / tch，Phase1 **尚未**有算子/内核层实证优势。
 3. **最大风险**：exact 门闩在 BF16/FP16 累计路径未钉死时易 **假阴性**；Q4_K_M 副赛道易变成第二套实现债；零依赖会推迟 tokenizer/SIMD/加速库，S1 exact 对齐可能极慢；仓库内 **无成文「四阶段」总路线文档**，与后续衔接需先书面钉死 Phase2+ 边界，否则接口债隐性累积。
 4. **建议立刻可执行**：按下文 §6 的门闩清单落地 `run_fingerprint` / exact 对齐 S1 / 赛道分表 / 累计路径写入指纹；**主宣称只走 SafeTensors BF16或FP16 一档**，Q4_K_M 副赛道可延后到 S1 exact 通后再开。
@@ -31,7 +33,7 @@
 | `PHASE1-ARENA-PROTOCOL-v0.md` | 历史草案；开放问题在 v0.1 已关闭（§7） |
 | `README.md` | AI-Native Runtime / 极简 Unikernel；Phase1 四点 focus；GitHub 写操作仅 OSdeveloper |
 | `Cargo.toml` + 四 crate | workspace：`weight_loader`, `tensor_core`, `model_core`, `runtime` |
-| `Cargo.lock` | 仅上述四包，**无第三方依赖条目** |
+| `Cargo.lock` | 起草时仅上述四包。**现含 `safetensors`（默认）+ 可选 `memmap2`（`host`）** |
 | `crates/*/src` | stub：`WeightMap`、`gemv_f32`、`MinimalistModel`、`main` 打印占位 |
 | `docs/`、`scripts/` | 目录存在但（写本分析前）无其他内容 |
 
@@ -61,13 +63,13 @@
 
 | 证据 | 内容 |
 |------|------|
-| 各 crate `Cargo.toml` | `weight_loader` / `tensor_core` 的 `[dependencies]` 为空；`model_core` / `runtime` 仅 path 依赖 workspace 兄弟 crate |
-| `Cargo.lock` | 无 `serde` / `memmap2` / `anyhow` / `half` / `candle-*` / `tch` 等第三方包 |
+| 各 crate `Cargo.toml` | 起草时 `weight_loader` / `tensor_core` 的 `[dependencies]` 为空。**现 `weight_loader` 默认 `safetensors`，可选 `memmap2`（`host`）**；`tensor_core` / `model_core` 仍无外部 crate；`model_core` / `runtime` 为 path 依赖，runtime 启用 `host` |
+| `Cargo.lock` | 起草时无第三方。**现有 `safetensors`（默认）+ 可选 `memmap2`（`host`）**；仍无 `anyhow` / `half` / `candle-*` / `tch` |
 | `#![cfg_attr(not(test), no_std)]` | 出现在 `weight_loader`、`tensor_core`、`model_core` 的 `lib.rs`（非 test 构建） |
 | `extern crate alloc` | `weight_loader`、`model_core` 使用 alloc，说明允许堆，但非 std-only API 绑定 |
 | `runtime` | **有 std**（`println!` bin）；描述为 “Minimal **host-side** inference loop” |
 
-结论（事实层）：Phase1 **core 三库**目前保持「无外部 crate + no_std 姿态」；**host runtime bin 可以依赖 std**。这与 README「极简 Unikernel」方向相容，但 **Unikernel 本身尚未在代码中出现**。
+结论（事实层）：Phase1 **core 三库**起草时保持「无外部 crate + no_std 姿态」；**现 `weight_loader` 默认依赖 `safetensors`，`host` 可选 `memmap2`，`tensor_core` / `model_core` 仍无外部 crate**。**host runtime bin 可以依赖 std**（`myos_runtime` 启用 `host`）。这与 README「极简 Unikernel」方向相容，但 **Unikernel 本身尚未在代码中出现**。
 
 ### 2.2 【已知事实】协议对「零依赖」的直接表述
 
