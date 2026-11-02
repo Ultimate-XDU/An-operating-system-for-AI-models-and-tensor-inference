@@ -5,6 +5,12 @@
 //! main-track numeric path: little-endian BF16 weight bytes, decoded to f32
 //! inside the op. Activations stay f32. The whole matrix is not loaded as f32.
 //! [`rmsnorm_f32`] is the f32-gamma reference for the same reduction.
+//! [`rope_f32`] and [`rope_f32_inplace`] rotate Q or K heads in f32. There is
+//! no weight byte view: the frequency table is `powf`, then libm `cosf`/`sinf`.
+//! Qwen2.5 passes [`ROPE_THETA_QWEN25`] (`1e6`) and, for the 1.5B model,
+//! [`HEAD_DIM_QWEN25_1_5B`] (`128`). Pairing is NeoX / half-rotate
+//! (HF Qwen2 `rotate_half`: lane `i` with lane `i + head_dim/2`);
+//! see the `rope` module.
 //!
 //! Fingerprint intent (the run hash is later): `quant_or_dtype=bf16`
 //! ([`QUANT_OR_DTYPE`]), `acc_path=bf16_w_fp32_acc` ([`ACC_PATH`]).
@@ -13,9 +19,13 @@
 #![cfg_attr(not(test), no_std)]
 
 mod bf16;
+mod rope;
 pub use bf16::{
     bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32, Bf16OpError,
     ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
+};
+pub use rope::{
+    rope_f32, rope_f32_inplace, rope_inv_freqs, RopeError, HEAD_DIM_QWEN25_1_5B, ROPE_THETA_QWEN25,
 };
 
 /// y[i] = sum_j W[i,j] * x[j]
