@@ -8,8 +8,9 @@
 //! [`rope_f32`] and [`rope_f32_inplace`] rotate Q or K heads in f32. There is
 //! no weight byte view: the frequency table is `powf`, then libm `cosf`/`sinf`.
 //! Qwen2.5 passes [`ROPE_THETA_QWEN25`] (`1e6`) and, for the 1.5B model,
-//! [`HEAD_DIM_QWEN25_1_5B`] (`128`). Pairing is interleaved even/odd
-//! (lane `2i` with lane `2i+1`); see the `rope` module.
+//! [`HEAD_DIM_QWEN25_1_5B`] (`128`). Pairing is NeoX / half-rotate
+//! (HF Qwen2 `rotate_half`: lane `i` with lane `i + head_dim/2`);
+//! see the `rope` module.
 //!
 //! Fingerprint intent (the run hash is later): `quant_or_dtype=bf16`
 //! ([`QUANT_OR_DTYPE`]), `acc_path=bf16_w_fp32_acc` ([`ACC_PATH`]).

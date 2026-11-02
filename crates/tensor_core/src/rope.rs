@@ -9,22 +9,19 @@
 //!
 //! # Pairing
 //!
-//! Interleaved even/odd. Dimension `2i` rotates with dimension `2i+1`:
+//! NeoX / half-rotate, the HF Qwen2 `rotate_half` layout and llama.cpp
+//! `LLAMA_ROPE_TYPE_NEOX`. Let `h = head_dim / 2`. Lane `i` rotates with
+//! lane `i + h`, and the same angle is used on both halves:
 //!
 //! ```text
-//! y[2i]   = x[2i] * cos - x[2i+1] * sin
-//! y[2i+1] = x[2i] * sin + x[2i+1] * cos
+//! y[i]   = x[i]     * cos - x[i + h] * sin
+//! y[i+h] = x[i + h] * cos + x[i]     * sin
 //! ```
 //!
 //! Products are formed first, then added or subtracted. The op does not
-//! call `mul_add`. This is the adjacent-lane layout from the RoPE paper
-//! and from llama.cpp's non-NeoX rope. It stays the contract for this
-//! module: a later switch to half-split lanes would move every Q and K bit.
-//!
-//! Hugging Face Qwen2 `rotate_half`, and llama.cpp Qwen2
-//! (`LLAMA_ROPE_TYPE_NEOX`), pair lane `i` with lane `i + head_dim/2` and
-//! repeat the frequency table across both halves. Same angles, different
-//! index permutation. These functions do not apply that permutation.
+//! call `mul_add`. This is the only pairing in the crate. Adjacent
+//! even/odd lanes (`2i` with `2i+1`) are a different index permutation
+//! and are not implemented.
 //!
 //! # Frequencies
 //!
@@ -161,23 +158,26 @@ fn rotate(
     let n_pairs = head_dim / 2;
     let position = position as f32;
     for pair in 0..n_pairs {
-        // One (cos, sin) for this pair, then every head. That is the
-        // position's frequency table: pair `i` does not depend on pair `i-1`.
+        // One (cos, sin) for this pair, then every head. The table is
+        // repeated across both halves: lane `pair` and lane `pair + h`
+        // share this angle. Pair `i` does not depend on pair `i-1`.
         let (cos, sin) = pair_cos_sin(pair, head_dim, theta, position);
         for head in 0..n_heads {
-            let off = head * head_dim + pair * 2;
-            let (even, odd) = if let Some(src) = x {
-                (src[off], src[off + 1])
+            let base = head * head_dim;
+            let i0 = base + pair;
+            let i1 = i0 + n_pairs;
+            let (x0, x1) = if let Some(src) = x {
+                (src[i0], src[i1])
             } else {
-                (y[off], y[off + 1])
+                (y[i0], y[i1])
             };
-            // Multiply, then add or subtract. Not `mul_add`.
-            let even_cos = even * cos;
-            let odd_sin = odd * sin;
-            let even_sin = even * sin;
-            let odd_cos = odd * cos;
-            y[off] = even_cos - odd_sin;
-            y[off + 1] = even_sin + odd_cos;
+            // HF `rotate_half`: multiply, then add or subtract. Not `mul_add`.
+            let x0_cos = x0 * cos;
+            let x1_sin = x1 * sin;
+            let x1_cos = x1 * cos;
+            let x0_sin = x0 * sin;
+            y[i0] = x0_cos - x1_sin;
+            y[i1] = x1_cos + x0_sin;
         }
     }
     Ok(())
@@ -259,14 +259,15 @@ mod tests {
 
     #[test]
     fn position_one_head_dim_two_is_rotation_by_one_radian() {
-        // inv_freq[0] = 1 / theta^0 = 1. (1, 0) -> (cos(1), sin(1)).
+        // head_dim = 2, so half = 1 and lane 0 pairs with lane 1.
+        // inv_freq[0] = 1. (1, 0) -> (cos(1), sin(1)).
         // Bits are libm sinf(1) / cosf(1), not a polynomial approximation.
         let mut y = [0.0; 2];
         rope_f32(&mut y, &[1.0, 0.0], 1, 2, ROPE_THETA_QWEN25).unwrap();
         assert_eq!(y[0].to_bits(), 0x3f0a_5140);
         assert_eq!(y[1].to_bits(), 0x3f57_6aa4);
 
-        // (3, 4) -> (3 cos - 4 sin, 3 sin + 4 cos), same angle.
+        // (3, 4) -> (3 cos - 4 sin, 4 cos + 3 sin), same angle.
         let mut y24 = [0.0; 2];
         rope_f32(&mut y24, &[3.0, 4.0], 1, 2, ROPE_THETA_QWEN25).unwrap();
         assert_eq!(y24[0].to_bits(), 0xbfdf_5b68);
@@ -279,11 +280,13 @@ mod tests {
 
     #[test]
     fn second_pair_uses_its_own_frequency() {
-        // head_dim = 4, position = 1, x = [0, 0, 1, 0].
-        // Pair 0 stays zero. Pair 1 has exponent 2/4 = 1/2,
+        // head_dim = 4, half = 2, position = 1, x = e_1.
+        // Pair 1 is lanes 1 and 3. Exponent 2/4 = 1/2,
         // inv_freq = 1/1000, angle = 0.001.
         // sin(0.001) is one ulp under the angle, so this is not the
         // sin(x) ≈ x shortcut. cos is not 1.
+        // Adjacent even/odd would rotate lanes 0 and 1 by 1 radian and
+        // would not leave lane 0 at zero.
         let mut table = [0.0; 2];
         rope_inv_freqs(&mut table, 4, ROPE_THETA_QWEN25).unwrap();
         assert_eq!(table[0].to_bits(), 1.0f32.to_bits());
@@ -291,25 +294,25 @@ mod tests {
         assert_eq!(table[1].to_bits(), 0x3a83_126f);
 
         let mut y = [9.0; 4];
-        rope_f32(&mut y, &[0.0, 0.0, 1.0, 0.0], 1, 4, ROPE_THETA_QWEN25).unwrap();
+        rope_f32(&mut y, &[0.0, 1.0, 0.0, 0.0], 1, 4, ROPE_THETA_QWEN25).unwrap();
         assert_eq!(y[0].to_bits(), 0);
-        assert_eq!(y[1].to_bits(), 0);
-        assert_eq!(y[2].to_bits(), 0x3f7f_fff8);
+        assert_eq!(y[2].to_bits(), 0);
+        assert_eq!(y[1].to_bits(), 0x3f7f_fff8);
         assert_eq!(y[3].to_bits(), 0x3a83_126e);
-        assert_ne!(y[2].to_bits(), 0x3f0a_5140); // not cos(1)
+        assert_ne!(y[1].to_bits(), 0x3f0a_5140); // not cos(1)
         assert_ne!(y[3].to_bits(), table[1].to_bits()); // not the raw angle
     }
 
     #[test]
     fn position_three_head_dim_four_matches_libm_bits() {
-        // x = [1, 2, 3, 4], theta = 1e6, position = 3.
-        // Pair 0 angle = 3. Pair 1 angle = 3/1000.
+        // x = [1, 2, 3, 4], theta = 1e6, position = 3, half = 2.
+        // Pair 0 (lanes 0, 2) angle = 3. Pair 1 (lanes 1, 3) angle = 3/1000.
         let x = [1.0f32, 2.0, 3.0, 4.0];
         let mut y = [0.0; 4];
         rope_f32(&mut y, &x, 3, 4, ROPE_THETA_QWEN25).unwrap();
         assert_eq!(
             y.map(f32::to_bits),
-            [0xbfa2_d884, 0xbfeb_5fee, 0x403f_3b2c, 0x4080_4995]
+            [0xbfb4_e8bc, 0x3ffe_767e, 0xc035_0c00, 0x4080_3101]
         );
 
         let mut inplace = x;
@@ -325,21 +328,23 @@ mod tests {
     }
 
     #[test]
-    fn qwen_head_pairs_adjacent_lanes_not_halves() {
-        // head_dim = 128, position = 1, x = e_0.
-        // Even/odd puts (cos 1, sin 1) in lanes 0 and 1.
-        // Half-split (NeoX / HF rotate_half) would put sin in lane 64.
+    fn qwen_head_is_neox_half_rotate() {
+        // head_dim = 128, half = 64, position = 1, x = e_0.
+        // NeoX puts cos(1) in lane 0 and sin(1) in lane 64.
+        // Adjacent even/odd would put sin(1) in lane 1 and leave lane 64 at 0.
+        let half = HEAD_DIM_QWEN25_1_5B / 2;
         let mut x = [0.0f32; HEAD_DIM_QWEN25_1_5B];
         x[0] = 1.0;
         let mut y = [0.0; HEAD_DIM_QWEN25_1_5B];
         rope_f32(&mut y, &x, 1, HEAD_DIM_QWEN25_1_5B, ROPE_THETA_QWEN25).unwrap();
         assert_eq!(y[0].to_bits(), 0x3f0a_5140);
-        assert_eq!(y[1].to_bits(), 0x3f57_6aa4);
+        assert_eq!(y[half].to_bits(), 0x3f57_6aa4);
+        assert_eq!(y[1], 0.0);
         assert_eq!(y[2], 0.0);
-        assert_eq!(y[64], 0.0);
         assert_eq!(y[127], 0.0);
 
-        // Last pair at position 8: x[126] = 1, x[127] = -2.
+        // Highest pair is lanes 63 and 127, frequency index 63.
+        // Position 8, x[63] = 1, x[127] = -2.
         // inv_freq[63] = 1 / theta^(126/128).
         let mut table = [0.0; HEAD_DIM_QWEN25_1_5B / 2];
         rope_inv_freqs(&mut table, HEAD_DIM_QWEN25_1_5B, ROPE_THETA_QWEN25).unwrap();
@@ -348,12 +353,13 @@ mod tests {
         assert_eq!(table[63].to_bits(), 0x35a6_8e4c);
 
         let mut last = [0.0f32; HEAD_DIM_QWEN25_1_5B];
-        last[126] = 1.0;
-        last[127] = -2.0;
+        last[half - 1] = 1.0;
+        last[HEAD_DIM_QWEN25_1_5B - 1] = -2.0;
         rope_f32_inplace(&mut last, 8, HEAD_DIM_QWEN25_1_5B, ROPE_THETA_QWEN25).unwrap();
-        assert_eq!(last[126].to_bits(), 0x3f80_00a7);
-        assert_eq!(last[127].to_bits(), 0xbfff_ffad);
-        assert_eq!(last[64], 0.0);
+        assert_eq!(last[half - 1].to_bits(), 0x3f80_00a7);
+        assert_eq!(last[HEAD_DIM_QWEN25_1_5B - 1].to_bits(), 0xbfff_ffad);
+        assert_eq!(last[half - 2], 0.0);
+        assert_eq!(last[1], 0.0);
     }
 
     #[test]

@@ -57,7 +57,7 @@ Fingerprint intent, hash later: `quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc
 
 `tensor_core::rope_f32` and `rope_f32_inplace` rotate one head or a batch of heads that share one position. Activations stay f32. Qwen2.5 passes `ROPE_THETA_QWEN25` (`1e6`). Qwen2.5-1.5B passes `HEAD_DIM_QWEN25_1_5B` (`128` = 1536 / 12). `rope_inv_freqs` writes the pair table those rotates use.
 
-Pairing is interleaved even/odd: lane `2i` rotates with lane `2i+1` (`x cos ∓ x_neighbor sin`, multiply then add or subtract, no `mul_add`). That adjacent-lane layout is the stable contract. It is the RoPE-paper / llama.cpp non-NeoX pairing. HF Qwen2 `rotate_half` and llama.cpp `LLAMA_ROPE_TYPE_NEOX` pair lane `i` with lane `i + head_dim/2` instead; this op does not.
+Pairing is NeoX / half-rotate, the same layout as HF Qwen2 `rotate_half` and llama.cpp `LLAMA_ROPE_TYPE_NEOX`. With `h = head_dim / 2`, lane `i` rotates with lane `i + h`: `y[i] = x[i] cos - x[i+h] sin`, `y[i+h] = x[i+h] cos + x[i] sin` (multiply then add or subtract, no `mul_add`). The same angle is used on both halves. Adjacent even/odd lanes are not a second entry point.
 
 `inv_freq[i] = 1 / powf(theta, (2i) / head_dim)`, then `angle = f32(position) * inv_freq[i]` and libm `cosf` / `sinf`. Each pair is independent (no iterative `freq *= theta**(-2/d)`). Position 0 is the identity on finite inputs. An odd `head_dim`, an empty buffer, or a length that is not a positive multiple of `head_dim` returns `Err` and does not write. GQA scores, KV cache, and SwiGLU are not in this step. The smoke line is still `[1, 2, 3, 0]`.
 
