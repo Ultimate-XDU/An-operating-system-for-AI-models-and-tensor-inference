@@ -67,7 +67,13 @@ Pairing is NeoX / half-rotate, the same layout as HF Qwen2 `rotate_half` and lla
 
 Layout, no batch axis: Q and Y are `[num_q_heads, head_dim]`. K and V are `[num_kv_heads, seq_len, head_dim]`. `scale = 1 / sqrtf(head_dim)` once (`attn_scale_f32`), then each score is `dot * scale` after a left-to-right dot (multiply, then add; not `mul_add`). Softmax is one thread over the visible keys: max starts at key 0 (`>`), `expf(score - max)`, left-to-right sum, then `e / sum` (division, not a reciprocal multiply). The value mix is the same left-to-right order. `probs` is scratch of length `seq_len`; on success it holds the last query head.
 
-`GqaMask::Full` scores the whole cache (decode that already stored only the legal prefix). `GqaMask::Causal { query_pos }` drops key index `t > query_pos` before the dot, so those V slots are not read. `query_pos >= seq_len - 1` keeps every key. A zero count, a query-head count that is not a multiple of the KV-head count, or a bad buffer length returns `Err` and does not write. KV-cache allocation, SwiGLU, and a multi-query prefill kernel are not in this step. The smoke line is still `[1, 2, 3, 0]`.
+`GqaMask::Full` scores the whole cache (decode that already stored only the legal prefix). `GqaMask::Causal { query_pos }` drops key index `t > query_pos` before the dot, so those V slots are not read. `query_pos >= seq_len - 1` keeps every key. A zero count, a query-head count that is not a multiple of the KV-head count, or a bad buffer length returns `Err` and does not write. KV-cache allocation and a multi-query prefill kernel are not in this step. The smoke line is still `[1, 2, 3, 0]`.
+
+## SwiGLU
+
+`tensor_core::swiglu_mul_f32` is the MLP middle: elementwise `SiLU(gate) * up` in f32. `silu_f32` is `x / (1 + expf(-x))` (libm `expf`, add one, then divide). The multiply by `up` runs after that quotient. It is not `x * (1 / (1 + expf(-x)))` and not `(gate * up) / (1 + expf(-gate))`. One thread, lane 0 onward. No `mul_add` and no polynomial sigmoid.
+
+Gate and up projections stay on `gemv_bf16` later (`mlp.gate_proj` / `mlp.up_proj`, no bias). This result is what `mlp.down_proj` will read. Qwen2.5-1.5B passes `INTERMEDIATE_SIZE_QWEN25_1_5B` (8960). The op does not hard-code that width. An empty buffer or a length mismatch returns `Err` and leaves `out` unchanged. Down-proj wiring is not in this step. The smoke line is still `[1, 2, 3, 0]`.
 
 ## Feature flags
 
