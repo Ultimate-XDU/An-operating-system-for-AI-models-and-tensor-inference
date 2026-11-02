@@ -2,6 +2,6 @@
 name = "tensor_core"
 version = "0.1.0"
 edition = "2021"
-description = "TensorCore: f32 fixture GEMV, BF16-weight GEMV, embed, RMSNorm, f32 RoPE, and f32 GQA attention"
+description = "TensorCore: f32 fixture GEMV, BF16-weight GEMV, embed, RMSNorm, f32 RoPE, f32 GQA attention, and f32 SwiGLU"
 
 [dependencies]
