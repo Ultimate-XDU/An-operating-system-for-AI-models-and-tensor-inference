@@ -1,10 +1,15 @@
-//! WeightLoaderCore — in-memory stand-in for SafeTensors / GGUF mapping (Phase 1).
+//! WeightLoaderCore — zero-copy weight views for Phase 1.
 //!
-//! P0 keeps tensor bytes in an owned buffer and hands out zero-copy `&[u8]` views.
-//! File mmap and real parsers stay on the P1 side of this API.
+//! [`MmapWeights`] is the in-memory f32 fixture behind the cycle smoke path.
+//! [`SafeTensorsWeights`] parses a SafeTensors byte buffer with the official
+//! `safetensors` crate (`std` feature off) and returns `&[u8]` views into that
+//! buffer. GGUF stays out of this crate for now.
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+mod safe_tensors;
+pub use safe_tensors::SafeTensorsWeights;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -12,15 +17,22 @@ use alloc::vec::Vec;
 use core::fmt;
 
 /// Element type stored in a tensor blob.
+///
+/// `F16` and `BF16` are SafeTensors storage tags. [`load_f32_tensor`] still
+/// accepts only [`DType::F32`]; this crate does not convert low-precision
+/// payloads to f32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
+    F16,
+    BF16,
 }
 
 impl DType {
     pub const fn size_of(self) -> usize {
         match self {
             DType::F32 => core::mem::size_of::<f32>(),
+            DType::F16 | DType::BF16 => 2,
         }
     }
 }
@@ -52,6 +64,10 @@ pub enum WeightError {
     EmptyName,
     DTypeMismatch,
     LengthMismatch,
+    /// The byte buffer is not a SafeTensors file this loader can read.
+    Parse,
+    /// Storage dtype is outside the mapped set (`F32`, `F16`, `BF16`).
+    UnsupportedDType,
 }
 
 impl fmt::Display for WeightError {
@@ -62,6 +78,8 @@ impl fmt::Display for WeightError {
             WeightError::EmptyName => write!(f, "tensor name is empty"),
             WeightError::DTypeMismatch => write!(f, "tensor dtype is not f32"),
             WeightError::LengthMismatch => write!(f, "tensor byte length does not match shape"),
+            WeightError::Parse => write!(f, "weight buffer could not be parsed"),
+            WeightError::UnsupportedDType => write!(f, "tensor dtype is not supported"),
         }
     }
 }
@@ -165,6 +183,7 @@ impl WeightMap for MmapWeights {
 ///
 /// The byte view stays borrowed from the map; the returned `Vec<f32>` is a native-endian decode
 /// so `tensor_core` can consume contiguous f32 without an alignment cast.
+/// SafeTensors payloads are little-endian, which matches this decode on a little-endian host.
 pub fn load_f32_tensor(
     map: &impl WeightMap,
     name: &str,

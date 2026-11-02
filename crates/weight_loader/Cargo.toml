@@ -5,3 +5,5 @@ edition = "2021"
 description = "WeightLoaderCore: format-agnostic zero-copy weight loading"
 
 [dependencies]
+# `std` off: no serde/std, serde_json/std, or tempfile. 0.8 is no_std + alloc.
+safetensors = { version = "0.8", default-features = false }
