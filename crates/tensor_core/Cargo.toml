@@ -2,6 +2,6 @@
 name = "tensor_core"
 version = "0.1.0"
 edition = "2021"
-description = "TensorCore: minimal GEMV/attention ops"
+description = "TensorCore: f32 fixture GEMV and BF16-weight ops"
 
 [dependencies]
