@@ -13,6 +13,15 @@ AI-Native Runtime：面向大模型与张量推理的极简 Unikernel。
 - 最小推理循环（prefill + decode，CPU）
 - 对打协议：见 `PHASE1-ARENA-PROTOCOL-v0.1.md`
 
+## Phase 1 P0 smoke
+
+```
+cargo test --workspace
+cargo run -p myos_runtime
+```
+
+`cargo run -p myos_runtime` prints `MyOS Phase1 smoke decode (prompt=0): [1, 2, 3, 0]`.
+
 ## Team
 
 GitHub 写操作仅由 OSdeveloper 负责；博弈手 / 仓寻 / 深析 / 联调官负责方案、搜索、分析与联调结论。

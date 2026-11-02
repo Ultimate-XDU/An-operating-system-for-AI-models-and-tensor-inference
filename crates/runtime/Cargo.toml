@@ -10,5 +10,3 @@ path = "src/main.rs"
 
 [dependencies]
 model_core = { path = "../model_core" }
-tensor_core = { path = "../tensor_core" }
-weight_loader = { path = "../weight_loader" }

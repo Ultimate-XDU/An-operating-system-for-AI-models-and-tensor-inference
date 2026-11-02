@@ -15,8 +15,6 @@ name = "myos_runtime"
 version = "0.1.0"
 dependencies = [
  "model_core",
- "tensor_core",
- "weight_loader",
 ]
 
 [[package]]
