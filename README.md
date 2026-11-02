@@ -47,6 +47,14 @@ Fingerprint intent, hash later: `quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc
 
 `gemv_f32` and the `cycle_fixture` smoke stay on the f32 fixture. `cargo run -p myos_runtime` is still `[1, 2, 3, 0]`. Unit tests build tiny BF16 tables in process; they do not download Qwen.
 
+## RMSNorm
+
+`tensor_core::rmsnorm_bf16_weight` is the next main-track op. Activations stay f32 across the op. Gamma is a little-endian BF16 vector (`2 * n` bytes), promoted with `bf16_le_to_f32` inside the loop. `rmsnorm_f32` is the same kernel with an f32 gamma, for exact comparisons.
+
+`Σx²` is one thread, left to right: `sum += x[i] * x[i]` (multiply, then add; not `mul_add`, not a tree). Then `inv_rms = 1 / sqrtf(sum / n + eps)` (IEEE-754 sqrt, not an approximate rsqrt) and `y[i] = w[i] * (x[i] * inv_rms)`. That reduction is the exact-sensitive part of `acc_path=bf16_w_fp32_acc` for this op: BF16 weights, f32 accumulation, no second dtype and no parallel sum. Qwen2.5 passes `RMS_NORM_EPS_QWEN25` (`1e-6`, `config.json` `rms_norm_eps`). Length mismatches return `Err` and leave `y` unchanged.
+
+RoPE, GQA, and SwiGLU are not in this step. The smoke line is still `[1, 2, 3, 0]`.
+
 ## Feature flags
 
 `weight_loader` is `no_std` + `alloc` by default. `tensor_core` and `model_core` depend on that default and do not enable host I/O.
