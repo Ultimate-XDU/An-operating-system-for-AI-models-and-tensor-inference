@@ -1,7 +1,10 @@
 //! ModelCore — unified MinimalistModel trait (Phase 1).
 //!
 //! `QwenStub` is a CPU toy: one embedding row plus one `lm_head` GEMV. It is not a Qwen block.
+//! Real 1.5B Instruct shapes live in [`qwen25_layout`] and are unused by the stub.
 #![cfg_attr(not(test), no_std)]
+
+pub mod qwen25_layout;
 
 extern crate alloc;
 
