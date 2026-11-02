@@ -15,3 +15,18 @@ pub fn gemv_f32(y: &mut [f32], w: &[f32], x: &[f32], m: usize, k: usize) {
         y[i] = acc;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::gemv_f32;
+
+    #[test]
+    fn gemv_f32_row_major_dots() {
+        // W is 2x3, row-major. y = W x.
+        let w = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x = [1.0, 1.0, 1.0];
+        let mut y = [0.0; 2];
+        gemv_f32(&mut y, &w, &x, 2, 3);
+        assert_eq!(y, [6.0, 15.0]);
+    }
+}
