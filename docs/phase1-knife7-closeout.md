@@ -4,7 +4,7 @@
 |----|------|
 | 口径 | `docs/phase1-next-coarse-knife-7.md` |
 | 基线 | main `5bb4065f`（刀⑥ pack 默认关） |
-| 本环境 | 无 Qwen2.5-1.5B 权重，**没有**跑 S1 128/128。CORRECT / DET / W=3 R=5 中位标 **UNMEASURED**。host 用下面的命令重跑后再把数字写进主表。 |
+| 本环境 | host 已于 2026-11-03 15:02 UTC+8 跑通 `--arena-s1`（W=3 R=5）。CORRECT/DET **PASS**；中位 T_decode 14.3503、L_TTFT 9092.903、L_TPOT 69.685、M_peak 2963.383；场景 **L**。账本见 `arena/phase1-scoreboard.md`，卡见 `arena/s1-myos-bf16-cost-card.md`。 |
 
 ## 已落地
 

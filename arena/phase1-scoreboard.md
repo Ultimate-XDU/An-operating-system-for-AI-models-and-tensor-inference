@@ -1,7 +1,7 @@
 # Phase1 Scoreboard（评测账本）
 
 **协议**：`PHASE1-ARENA-PROTOCOL-v0.1.md`  
-**更新**：2026-11-03 UTC+8 · 刀⑦ S1 对打槽（threads=8；MyOS 中位待 host）  
+**更新**：2026-11-03 17:40 UTC+8 · 刀⑦ host `--arena-s1` 已填中位（CORRECT/DET PASS，场景 L）  
 **合入**：交 OSdeveloper 推仓（本文件不直接 git push）
 
 ---
@@ -13,7 +13,7 @@
 | E0 冻结 | ✅ | v0.1：1.5B / exact / S3=4096 / CPU / ±5% |
 | E1 llama 基线 S1 | 🟡 部分 | 主赛道 BF16+FP16 DET-PASS；副赛道 Q4 DET-FAIL 仅参考 |
 | E2 MyOS exact S1 | ✅ | CORRECT PASS vs BF16 金标准（当时 threads=1） |
-| 主赛道 S1 吞吐对打 | 🟡 闭环已接线，中位未测 | 刀⑦：threads=8 行维并行 + W=3/R=5 harness。本环境无 1.5B 权重，MyOS 中位 UNMEASURED，场景按 §4.3 **不可比**（不是空行，也不是 W/T/L） |
+| 主赛道 S1 吞吐对打 | ✅ 可比已落地 | 刀⑦ host W=3/R=5 中位已填。CORRECT/DET PASS；场景 **L**（加权和 -80）。卡：`arena/s1-myos-bf16-cost-card.md`；产物：`runs/s1-myos-bf16-t8/` |
 | 副赛道 Q4 对打 | ⬜ 未开 | 协议：不对打直至另议 |
 
 ---
@@ -23,7 +23,7 @@
 | 实现 | run_id | DET | CORRECT | T_decode | L_TTFT ms | L_TPOT ms | M_peak MiB | 备注 |
 |------|--------|-----|---------|----------|-----------|-----------|------------|------|
 | llama.cpp b11960 | `s1-llamacpp-bf16-b11960` | PASS | 金标准 | 17.2348 | 608.110 | 58.022 | 3050.953 | 自转 GGUF BF16；`-t 8`；E2 ref；ratio 分母 |
-| MyOS threads=8（刀⑦） | `s1-myos-bf16-t8` | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | 正式对打槽。`bf16` / `bf16_w_fp32_acc`，batch=1，`gemv_pack=false`。与上一行同 `n_threads=8`。卡：`arena/s1-myos-bf16-cost-card.md` |
+| MyOS threads=8（刀⑦） | `s1-myos-bf16-t8` | **PASS** | **PASS** | 14.3503 | 9092.903 | 69.685 | 2963.383 | host 2026-11-03 15:02 UTC+8；`bf16` / `bf16_w_fp32_acc`，batch=1，`gemv_pack=false`；commit `9577e66`。卡：`arena/s1-myos-bf16-cost-card.md` |
 | MyOS `42acbb39` | `e2-myos-s1` | （单次 greedy） | **PASS** exact 128/128 | — | — | — | — | 历史正确性收口；指纹 threads=1，**不**拿来和 `-t 8` 比吞吐 |
 | llama.cpp b11960 | `s1-llamacpp-fp16-b11960` | PASS | （非 E2 ref） | 18.84 | 841.1 | 53.07 | 6377 | 官方 FP16；并列主赛道参考，非本 E2 金标准 |
 
@@ -31,13 +31,13 @@
 
 | 指标 | MyOS | llama | ratio (MyOS/base) | 判定 |
 |------|------|-------|-------------------|------|
-| T_decode | UNMEASURED | 17.2348 | — | UNMEASURED |
-| L_TTFT | UNMEASURED | 608.110 | — | UNMEASURED |
-| L_TPOT | UNMEASURED | 58.022 | — | UNMEASURED |
-| M_peak | UNMEASURED | 3050.953 | — | UNMEASURED |
-| 场景 | — | — | — | **不可比**（§4.3：挑战者中位未跑出）。权重仍是 T_decode 0.35 / L_TPOT 0.25 / L_TTFT 0.20 / M_peak 0.20。host 填上 MyOS 中位后：≥1.05 或 ≤0.95 才是 W 或 L，其余 T；CORRECT 或 DET 失败则场景负且吞吐作废。 |
+| T_decode | 14.3503 | 17.2348 | 0.8326 | L |
+| L_TTFT | 9092.903 | 608.110 | 14.9527 | L |
+| L_TPOT | 69.685 | 58.022 | 1.2010 | L |
+| M_peak | 2963.383 | 3050.953 | 0.9713 | T |
+| 场景 | — | — | 加权和 -80 | **L**（CORRECT/DET 均 PASS，吞吐可比；未达 ±5% 胜） |
 
-本环境没有宣称 ±5% 胜。软记录（GEMV 微基准，不是 S1）：gate/up `[8960, 1536]`，threads=1 → 8 为 3.611×（4 cores）。见 `docs/phase1-knife7-closeout.md`。
+权重：T_decode 0.35 / L_TPOT 0.25 / L_TTFT 0.20 / M_peak 0.20。这不是「已经胜过 llama」的对外句。软记录（GEMV 微基准，不是 S1）：gate/up `[8960, 1536]`，threads=1 → 8 为 3.611×（云端 4 cores）。见 `docs/phase1-knife7-closeout.md`。
 
 ---
 
@@ -62,7 +62,7 @@
 
 ## 下一步（协议 §8）
 
-1. host 重跑刀⑦ `--arena-s1 --threads 8`（W=3 R=5），把 MyOS 中位填进 `arena/s1-myos-bf16-cost-card.md` 与上表。未测前场景保持不可比。命令见 `docs/phase1-knife7-closeout.md`。
+1. ~~host 重跑刀⑦ `--arena-s1`~~ **已完成**（2026-11-03 15:02 UTC+8）。账本与 cost-card 已填。交 OSdeveloper 把 `arena/phase1-scoreboard.md` + cost-card 推上 [PR #39](https://github.com/Ultimate-XDU/An-operating-system-for-AI-models-and-tensor-inference/pull/39) 后再合入。
 2. E1 补 S2/S3/S6 基线（若尚未闭合）
 3. 副赛道保持关闭，除非月星/协议升版
-
+4. 场景 L 的主因是 L_TTFT（约 15× llama）；下一刀若继续吞吐，应先钉 prefill 路径，而不是再拆标量 GEMV 微刀
