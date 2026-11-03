@@ -1,0 +1,5 @@
+<|im_start|>system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Write a clear, factual, middle-school-level explanation of the water cycle. Cover evaporation, condensation, precipitation, and collection. Use short sentences. Do not use bullet points. Keep the tone precise and educational. Additionally please include one short sentence about how sunlight provides energy for evaporation and how plants participate through transpiration in forests and grasslands around rivers. Additionally please include one short sentence about how sunlight provides energy for evaporation and how plants participate through transpiration in forests and grasslands<|im_end|>
+<|im_start|>assistant
