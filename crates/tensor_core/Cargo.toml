@@ -4,4 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "TensorCore: f32 fixture GEMV, BF16-weight GEMV, BF16 bias add, embed, RMSNorm, f32 RoPE, f32 GQA attention, and SwiGLU"
 
+[features]
+# Host runtime enables this. The numeric kernel stays free of std; the
+# feature only adds the row-parallel GEMV pool. Default is off so a no_std
+# build of this crate does not link std.
+default = []
+std = []
+
 [dependencies]

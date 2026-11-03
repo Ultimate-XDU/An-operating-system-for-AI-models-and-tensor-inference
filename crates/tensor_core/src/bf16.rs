@@ -72,12 +72,32 @@ pub fn bf16_le_to_f32(le: [u8; 2]) -> f32 {
 /// when the CPU supports it. Each row still walks `j` from `0` to `k - 1`
 /// in that order, so the f32 bits match a scalar left-to-right loop.
 /// Weights stay a byte view: this does not build an f32 copy of `w`.
+///
+/// When this crate is built with `std` (or under `cargo test`), rows are
+/// split across [`crate::gemv_bf16_threads`] workers. Each worker runs the
+/// same kernel on a contiguous row span. `threads == 1` stays on the calling
+/// thread. The split does not change per-row multiply-then-add order.
 pub fn gemv_bf16(
     y: &mut [f32],
     w: &[u8],
     x: &[f32],
     m: usize,
     k: usize,
+) -> Result<(), Bf16OpError> {
+    gemv_bf16_at_threads(y, w, x, m, k, crate::gemv_bf16_threads())
+}
+
+/// Same contract as [`gemv_bf16`], with an explicit worker count.
+///
+/// `threads` is clamped to `1..=GEMV_THREADS_MAX` by the row split. The
+/// process-wide showdown count is what [`gemv_bf16`] passes.
+pub(crate) fn gemv_bf16_at_threads(
+    y: &mut [f32],
+    w: &[u8],
+    x: &[f32],
+    m: usize,
+    k: usize,
+    threads: usize,
 ) -> Result<(), Bf16OpError> {
     if y.len() != m || x.len() != k {
         return Err(Bf16OpError::Shape);
@@ -97,8 +117,20 @@ pub fn gemv_bf16(
     if w.len() != need {
         return Err(Bf16OpError::Shape);
     }
-    crate::gemv_bf16_kernel::gemv_bf16_rows(y, w, x);
+    dispatch_gemv_bf16(y, w, x, threads);
     Ok(())
+}
+
+fn dispatch_gemv_bf16(y: &mut [f32], w: &[u8], x: &[f32], threads: usize) {
+    #[cfg(any(feature = "std", test))]
+    {
+        crate::gemv_pool::gemv_bf16_rows_parallel(y, w, x, threads);
+    }
+    #[cfg(not(any(feature = "std", test)))]
+    {
+        let _ = threads;
+        crate::gemv_bf16_kernel::gemv_bf16_rows(y, w, x);
+    }
 }
 
 /// `y[i] += bf16_to_f32(bias[i])`.

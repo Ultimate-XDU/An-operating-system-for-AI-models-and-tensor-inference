@@ -30,14 +30,20 @@
 //! left to right, f32. Qwen2.5 passes [`RMS_NORM_EPS_QWEN25`] (`1e-6`).
 //! GQA stays on f32 activations (no second dtype). Its exact-sensitive steps
 //! are the serial dot, the f32 scale, and the serial max / `expf` / sum / divide.
-//! SwiGLU stays on that path too: serial GEMV, `expf` inside SiLU, the
+//! SwiGLU stays on that path too: GEMV, `expf` inside SiLU, the
 //! division form of SiLU, and a left-to-right multiply. No second dtype.
 //! [`gemv_bf16`] may walk several rows in one pass. Each row is still one
 //! left-to-right f32 chain (`acc += w * x`, not a fused multiply-add).
-#![cfg_attr(not(test), no_std)]
+//! Feature `std` (enabled by the host runtime) partitions those rows across
+//! [`gemv_bf16_threads`] workers. The showdown default is [`SHOWDOWN_THREADS`]
+//! (8). Workers do not reduce across rows. Panel pack stays off unless
+//! [`set_gemv_bf16_panel_pack`] is set.
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 mod bf16;
 mod gemv_bf16_kernel;
+#[cfg(any(feature = "std", test))]
+mod gemv_pool;
 mod gqa;
 mod rope;
 mod swiglu;
@@ -45,7 +51,11 @@ pub use bf16::{
     add_bf16_bias, bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32,
     Bf16OpError, ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
 };
-pub use gemv_bf16_kernel::{set_gemv_bf16_panel_pack, set_gemv_bf16_prefetch};
+pub use gemv_bf16_kernel::{
+    gemv_bf16_panel_pack, gemv_bf16_threads, gemv_row_spans, set_gemv_bf16_panel_pack,
+    set_gemv_bf16_prefetch, set_gemv_bf16_threads, GemvRowSpans, GEMV_THREADS_MAX,
+    SHOWDOWN_THREADS,
+};
 pub use gqa::{
     attn_scale_f32, gqa_attn_f32, GqaError, GqaMask, GqaShape, GQA_Q_PER_KV_QWEN25_1_5B,
     NUM_ATTENTION_HEADS_QWEN25_1_5B, NUM_KV_HEADS_QWEN25_1_5B,
