@@ -24,6 +24,8 @@ cargo run -p myos_runtime
 
 `cargo run -p myos_runtime` prints `MyOS Phase1 smoke decode (prompt=0): [1, 2, 3, 0]`.
 
+`--block-fixture` is a separate path (knife ③). It does not print that cycle line. It greedy-decodes a tiny in-process BF16 block and prints `MyOS Phase1 block fixture (prompt=0): [1, 1, 1, 1]`. It does not download Qwen.
+
 Optional debug print of a SafeTensors file (tensor count and sorted names), then the same smoke line:
 
 ```
@@ -79,7 +81,7 @@ Layout, no batch axis: Q and Y are `[num_q_heads, head_dim]`. K and V are `[num_
 
 `tensor_core::swiglu_bf16` is one token's Qwen2 MLP. Activations stay f32. `mlp.gate_proj.weight`, `mlp.up_proj.weight`, and `mlp.down_proj.weight` stay little-endian BF16 views and go through `gemv_bf16` (row-major `[out, in]`, f32 dot, left to right, multiply then add). `swiglu_f32` is the same graph on f32 weights. Qwen2.5-1.5B passes `HIDDEN_SIZE_QWEN25_1_5B` (1536) and `INTERMEDIATE_SIZE_QWEN25_1_5B` (8960): gate and up are `[8960, 1536]`, down is `[1536, 8960]`. Counts sit on `SwigluShape` so a test can shrink them.
 
-`gate = gemv(gate_proj, x)`, `up = gemv(up_proj, x)`, `h[i] = silu(gate[i]) * up[i]`, `y = gemv(down_proj, h)`. None of the three projections adds a bias (Qwen2.5 `mlp.*` has none). `silu_f32` is `z / (1 + expf(-z))` (libm `expf`, one division). That is llama.cpp `ggml_silu_f32`. It is not `z * (1 / (1 + expf(-z)))`; those differ by an ulp. The product is one multiply after SiLU returns, not `mul_add`. `gate`, `up`, and `h` are caller scratch of length `intermediate`. On success they hold those three vectors. A zero dimension or a bad buffer length returns `SwigluError::Shape` and does not write. The transformer block is not this step. The smoke line is still `[1, 2, 3, 0]`.
+`gate = gemv(gate_proj, x)`, `up = gemv(up_proj, x)`, `h[i] = silu(gate[i]) * up[i]`, `y = gemv(down_proj, h)`. None of the three projections adds a bias (Qwen2.5 `mlp.*` has none). `silu_f32` is `z / (1 + expf(-z))` (libm `expf`, one division). That is llama.cpp `ggml_silu_f32`. It is not `z * (1 / (1 + expf(-z)))`; those differ by an ulp. The product is one multiply after SiLU returns, not `mul_add`. `gate`, `up`, and `h` are caller scratch of length `intermediate`. On success they hold those three vectors. A zero dimension or a bad buffer length returns `SwigluError::Shape` and does not write. `forward_token` calls this op after `post_attention_layernorm` and adds the result onto the residual (knife ③, below). The smoke line is still `[1, 2, 3, 0]`.
 
 ## KV cache and attention wiring
 
@@ -87,9 +89,15 @@ Knife ② is one attention layer. `model_core::KvCache` stores K and V for every
 
 Each slot is `[kv_head, pos, head_dim]` with a `max_seq` stride. The layer packs the committed prefix plus the token just projected into `[kv_head, seq, head_dim]` and calls `gqa_attn_f32` with `GqaMask::Full`. Scores stay in that op (`e / sum`).
 
-`attention_layer` borrows `q/k/v/o` weights and the `q/k/v` biases through `qwen25_bf16` (little-endian BF16 views). Shapes come from `AttnShape`, so a fixture can be smaller than 1536. `gemv_bf16` writes each projection, then `add_bf16_bias` adds the Q/K/V bias in f32. `o_proj` has no bias. Q and K go through `rope_f32_inplace` (NeoX, one position, every head). V is not rotated. The output GEMV is added onto `residual`. `proj_in` is the QKV input. This step does not RMSNorm and does not run SwiGLU. Passing the same values for `proj_in` and the residual skips the norm. The full block — input norm, every layer, SwiGLU, prefill/decode — is knife ③.
+`attention_layer` borrows `q/k/v/o` weights and the `q/k/v` biases through `qwen25_bf16` (little-endian BF16 views). Shapes come from `AttnShape`, so a fixture can be smaller than 1536. `gemv_bf16` writes each projection, then `add_bf16_bias` adds the Q/K/V bias in f32. `o_proj` has no bias. Q and K go through `rope_f32_inplace` (NeoX, one position, every head). V is not rotated. The output GEMV is added onto `residual`. `proj_in` is the QKV input. This step does not RMSNorm and does not run SwiGLU. Passing the same values for `proj_in` and the residual skips the norm. The full block is knife ③.
 
-`QwenStub` still counts tokens on `StubCursor`. `cargo run -p myos_runtime` is still `[1, 2, 3, 0]`. Unit tests build tiny BF16 tables in process; they do not download Qwen.
+## Transformer block (knife ③)
+
+`model_core::forward_token` is one token through every layer, then the tied head. The loop follows ember `Model::forward` (MIT, Copyright (c) 2026 Ali Zulfiqar, `src/model.rs`): `input_layernorm`, `attention_layer` (which adds `o_proj` onto the residual), `post_attention_layernorm`, `swiglu_bf16` (`down(SiLU(gate) ⊙ up)`, no MLP bias), residual add. After the last layer, `model.norm.weight` and `gemv_bf16` on `model.embed_tokens.weight`. There is no `lm_head` key. Weights stay little-endian BF16 views (`acc_path=bf16_w_fp32_acc`). Counts sit on `BlockShape`, so a test can shrink them. Qwen2.5-1.5B passes `BlockShape::qwen25_1_5b` (28 layers, hidden 1536, intermediate 8960, vocab 151936, `rms_norm_eps` 1e-6).
+
+`attention_layer` still does not advance the cache. `forward_token` stores every layer at the current cursor, then `KvCache::advance` once. `prefill` feeds prompt token ids. `greedy_decode` feeds `greedy_token` back in and does not advance a second time. Phase1 core takes token ids; it does not tokenize. Prefill here is one token at a time, not a multi-query kernel.
+
+`QwenStub` still counts tokens on `StubCursor`. `cargo run -p myos_runtime` is still `[1, 2, 3, 0]`. `--block-fixture` runs `block_fixture` (hidden 2, vocab 4, one layer, built in process) and prints `[1, 1, 1, 1]`. Unit tests build tiny BF16 tables in process; they do not download Qwen.
 
 ## Feature flags
 

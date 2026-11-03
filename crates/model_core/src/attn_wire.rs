@@ -3,8 +3,8 @@
 //! This is the attention half of a transformer block. It does not RMSNorm,
 //! it does not run SwiGLU, and it does not walk every layer. The caller
 //! passes `proj_in` (the vector Q/K/V read) and a separate `residual` (the
-//! stream `o_proj` is added onto). A full block will pass the input-norm
-//! output as `proj_in` and the pre-norm stream as `residual`.
+//! stream `o_proj` is added onto). [`crate::forward_token`] passes the
+//! input-norm output as `proj_in` and the pre-norm stream as `residual`.
 //!
 //! Control flow for the cache follows ember (MIT, Copyright (c) 2026 Ali
 //! Zulfiqar, <https://github.com/codewithfourtix/ember> `src/attention.rs`

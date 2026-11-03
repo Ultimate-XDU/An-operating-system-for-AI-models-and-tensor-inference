@@ -5,16 +5,23 @@
 //! Real 1.5B Instruct names and shapes live in [`qwen25_layout`].
 //! [`qwen25_bf16`] borrows those tensors as BF16 bytes.
 //! [`KvCache`] stores per-layer K and V. [`attention_layer`] runs one attention
-//! layer into that cache. The stub calls neither. A full block forward is later.
+//! layer into that cache and does not advance it. [`forward_token`] runs every
+//! block, the final norm, and the tied embedding head, then advances once.
+//! The stub calls none of those.
 #![cfg_attr(not(test), no_std)]
 
 pub mod attn_wire;
 pub mod kv_cache;
 pub mod qwen25_bf16;
+pub mod qwen25_block;
 pub mod qwen25_layout;
 
 pub use attn_wire::{attention_layer, AttnError, AttnShape, AttnWorkspace};
 pub use kv_cache::{KvCache, KvError, KvShape};
+pub use qwen25_block::{
+    block_fixture, fixture_shape, forward_token, greedy_decode, prefill, BlockError, BlockShape,
+    BlockWorkspace,
+};
 
 extern crate alloc;
 
