@@ -19,10 +19,19 @@
 //!
 //! Both of those decodes write `runs/<id>/run_fingerprint.json`.
 //!
+//! `--threads N` is the showdown width (default 8, matching llama S1 BF16
+//! `-t 8`). GEMV rows are split across that many workers. `batch` stays 1.
+//! A weights decode also writes `metrics.json` (`t_load`, `t_prefill`,
+//! `t_decode`, `M_peak`). `--arena-s1` repeats that process W=3 then R=5
+//! and writes the cost card. It does not decode in the parent.
+//!
 //! GEMV toggles (default keeps the knife-5 strided kernel):
 //! `MYOS_GEMV_PACK=1` packs each 32-row K-tile into column-major scratch.
-//! `MYOS_GEMV_PREFETCH=0` turns off software prefetch of the weight stream.
+//! That pack stays off unless the variable is set. `MYOS_GEMV_PREFETCH=0`
+//! turns off software prefetch of the weight stream.
+mod arena;
 mod fingerprint;
+mod meter;
 
 use fingerprint::{
     default_run_dir, git_commit_at, write_run_fingerprint, write_token_ids, RunFingerprint,
@@ -38,12 +47,15 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
+
+use meter::{PhaseSample, SampleFile, SampleHeader};
 use weight_loader::{SafeTensorsMmap, WeightError, WeightFileError, WeightMap};
 
 const SMOKE_VOCAB: usize = 4;
 const SMOKE_STEPS: usize = 4;
 const SMOKE_PROMPT: u32 = 0;
-const USAGE: &str = "myos [--weights PATH] [--block-fixture] [--steps N] [--fingerprint-dir DIR] [--prompt-ids PATH] [--ref-ids PATH]";
+const USAGE: &str = "myos [--weights PATH] [--block-fixture] [--steps N] [--threads N] [--fingerprint-dir DIR] [--prompt-ids PATH] [--ref-ids PATH] [--arena-s1] [--warmup N] [--repeats N] [--cost-card PATH]";
 
 /// `MYOS_GEMV_PACK` / `MYOS_GEMV_PREFETCH`. Unset leaves the defaults
 /// (pack off, prefetch on).
@@ -74,6 +86,11 @@ fn main() -> ExitCode {
         }
     };
     apply_gemv_toggles();
+    tensor_core::set_gemv_bf16_threads(cli.threads);
+
+    if cli.arena_s1 {
+        return run_arena_cli(&cli);
+    }
 
     let reference = match load_ref_ids(cli.ref_ids.as_deref()) {
         Ok(ids) => ids,
@@ -123,23 +140,55 @@ fn main() -> ExitCode {
         };
         let steps = cli.steps;
         let prompt_token = prompt[0];
-        return match weights_decode(Path::new(&path), &prompt, steps) {
-            Ok(tokens) => {
-                let generated = cli.prompt_ids.as_ref().map(|_| tokens.as_slice());
-                if let Err(err) = write_cli_fingerprint(
+        return match weights_decode_timed(Path::new(&path), &prompt, steps) {
+            Ok(timed) => {
+                let generated = cli.prompt_ids.as_ref().map(|_| timed.tokens.as_slice());
+                let fp_path = match write_cli_fingerprint(
                     RunKind::Weights,
                     BlockShape::qwen25_1_5b(),
                     &cli,
                     &prompt,
                     generated,
                 ) {
-                    eprintln!("MyOS fingerprint: {err}");
-                    return ExitCode::from(1);
+                    Ok(path) => path,
+                    Err(err) => {
+                        eprintln!("MyOS fingerprint: {err}");
+                        return ExitCode::from(1);
+                    }
+                };
+                let correct = reference
+                    .as_deref()
+                    .map(|ids| correct_line(&timed.tokens, ids).starts_with("CORRECT: PASS"));
+                if let Some(dir) = fp_path.parent() {
+                    let file = SampleFile {
+                        header: SampleHeader {
+                            threads: cli.threads as u64,
+                            batch: 1,
+                            quant_or_dtype: tensor_core::QUANT_OR_DTYPE.to_string(),
+                            acc_path: tensor_core::ACC_PATH.to_string(),
+                            gemv_pack: tensor_core::gemv_bf16_panel_pack(),
+                        },
+                        sample: PhaseSample {
+                            t_load_s: timed.t_load.as_secs_f64(),
+                            t_prefill_s: timed.t_prefill.as_secs_f64(),
+                            t_decode_s: timed.t_decode.as_secs_f64(),
+                            n_prompt: prompt.len() as u64,
+                            n_gen: steps as u64,
+                            m_peak_kib: timed.m_peak_kib,
+                            m_rss_after_load_kib: timed.rss_after_load_kib,
+                            correct,
+                        },
+                    };
+                    if let Err(err) = meter::write_sample_file(dir, &file) {
+                        eprintln!("MyOS metrics: {err}");
+                        return ExitCode::from(1);
+                    }
                 }
                 println!(
-                    "MyOS Phase1 weights decode (prompt={prompt_token}, steps={steps}): {tokens:?}"
+                    "MyOS Phase1 weights decode (prompt={prompt_token}, steps={steps}): {:?}",
+                    timed.tokens
                 );
-                print_correct(&tokens, reference.as_deref());
+                print_correct(&timed.tokens, reference.as_deref());
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -162,18 +211,26 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Clone)]
 struct Cli {
     weights: Option<String>,
     block_fixture: bool,
     steps: usize,
+    threads: usize,
     fingerprint_dir: Option<String>,
     prompt_ids: Option<String>,
     ref_ids: Option<String>,
+    arena_s1: bool,
+    warmup: usize,
+    repeats: usize,
+    cost_card: Option<String>,
 }
 
 /// `--weights PATH` or `--weights=PATH`, optional `--block-fixture`,
-/// `--steps N` (default [`SMOKE_STEPS`]), optional `--fingerprint-dir`,
-/// optional `--prompt-ids`, and optional `--ref-ids`.
+/// `--steps N` (default [`SMOKE_STEPS`], or 128 with `--arena-s1`),
+/// `--threads N` (default [`tensor_core::SHOWDOWN_THREADS`]),
+/// optional `--fingerprint-dir`, optional `--prompt-ids`, optional `--ref-ids`,
+/// and `--arena-s1` with `--warmup` / `--repeats` / `--cost-card`.
 ///
 /// A missing value or any other argument is a usage error. `MYOS_WEIGHTS` is
 /// not read here so tests can supply argv without the process environment.
@@ -185,9 +242,14 @@ where
     let mut path = None;
     let mut block_fixture = false;
     let mut steps = None;
+    let mut threads = None;
     let mut fingerprint_dir = None;
     let mut prompt_ids = None;
     let mut ref_ids = None;
+    let mut arena_s1 = false;
+    let mut warmup = None;
+    let mut repeats = None;
+    let mut cost_card = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let arg = arg.as_ref();
@@ -209,6 +271,40 @@ where
                 return Err("--steps was given more than once".to_string());
             }
             steps = Some(parse_steps(&value)?);
+            continue;
+        }
+        if let Some(value) = match_flag(arg, "--threads", &mut args)? {
+            if threads.is_some() {
+                return Err("--threads was given more than once".to_string());
+            }
+            threads = Some(parse_threads(&value)?);
+            continue;
+        }
+        if arg == "--arena-s1" {
+            if arena_s1 {
+                return Err("--arena-s1 was given more than once".to_string());
+            }
+            arena_s1 = true;
+            continue;
+        }
+        if let Some(value) = match_flag(arg, "--warmup", &mut args)? {
+            if warmup.is_some() {
+                return Err("--warmup was given more than once".to_string());
+            }
+            warmup = Some(parse_warmup(&value)?);
+            continue;
+        }
+        if let Some(value) = match_flag(arg, "--repeats", &mut args)? {
+            if repeats.is_some() {
+                return Err("--repeats was given more than once".to_string());
+            }
+            repeats = Some(parse_repeats(&value)?);
+            continue;
+        }
+        if let Some(value) = match_flag(arg, "--cost-card", &mut args)? {
+            if cost_card.replace(value).is_some() {
+                return Err("--cost-card was given more than once".to_string());
+            }
             continue;
         }
         if let Some(value) = match_flag(arg, "--fingerprint-dir", &mut args)? {
@@ -240,13 +336,38 @@ where
     if prompt_ids.is_some() && block_fixture {
         return Err("--prompt-ids cannot be combined with --block-fixture".to_string());
     }
+    if arena_s1 && block_fixture {
+        return Err("--arena-s1 cannot be combined with --block-fixture".to_string());
+    }
+    if arena_s1 && path.is_none() {
+        return Err("--arena-s1 needs --weights".to_string());
+    }
+    if arena_s1 && prompt_ids.is_none() {
+        return Err("--arena-s1 needs --prompt-ids".to_string());
+    }
+    if arena_s1 && ref_ids.is_none() {
+        return Err("--arena-s1 needs --ref-ids".to_string());
+    }
+    if !arena_s1 && (warmup.is_some() || repeats.is_some() || cost_card.is_some()) {
+        return Err("--warmup, --repeats, and --cost-card need --arena-s1".to_string());
+    }
+    let steps = match steps {
+        Some(steps) => steps,
+        None if arena_s1 => 128,
+        None => SMOKE_STEPS,
+    };
     Ok(Cli {
         weights: path,
         block_fixture,
-        steps: steps.unwrap_or(SMOKE_STEPS),
+        steps,
+        threads: threads.unwrap_or(tensor_core::SHOWDOWN_THREADS),
         fingerprint_dir,
         prompt_ids,
         ref_ids,
+        arena_s1,
+        warmup: warmup.unwrap_or(3),
+        repeats: repeats.unwrap_or(5),
+        cost_card,
     })
 }
 
@@ -279,7 +400,8 @@ where
 
 fn flag_noun(name: &str) -> &'static str {
     match name {
-        "--steps" => "a positive integer",
+        "--steps" | "--threads" | "--repeats" => "a positive integer",
+        "--warmup" => "a non-negative integer",
         _ => "a path",
     }
 }
@@ -288,6 +410,34 @@ fn parse_steps(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
         Ok(0) | Err(_) => Err(format!("--steps needs a positive integer, got `{value}`")),
         Ok(n) => Ok(n),
+    }
+}
+
+fn parse_threads(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if (1..=tensor_core::GEMV_THREADS_MAX).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "--threads needs an integer from 1 to {}, got `{value}`",
+            tensor_core::GEMV_THREADS_MAX
+        )),
+    }
+}
+
+fn parse_warmup(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if n <= 100 => Ok(n),
+        _ => Err(format!(
+            "--warmup needs an integer from 0 to 100, got `{value}`"
+        )),
+    }
+}
+
+fn parse_repeats(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if (1..=100).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "--repeats needs an integer from 1 to 100, got `{value}`"
+        )),
     }
 }
 
@@ -313,10 +463,85 @@ fn check_safetensors(path: &Path) -> Result<(), WeightFileError> {
 /// [`SafeTensorsWeights`](weight_loader::SafeTensorsWeights) borrows the map.
 /// [`decode_bf16`] reads those bytes through the existing block. Nothing here
 /// calls `load_f32_tensor`.
+struct TimedDecode {
+    tokens: Vec<u32>,
+    t_load: std::time::Duration,
+    t_prefill: std::time::Duration,
+    t_decode: std::time::Duration,
+    rss_after_load_kib: Option<u64>,
+    m_peak_kib: Option<u64>,
+}
+
+#[cfg(test)]
 fn weights_decode(path: &Path, prompt: &[u32], steps: usize) -> Result<Vec<u32>, WeightsError> {
+    weights_decode_timed(path, prompt, steps).map(|timed| timed.tokens)
+}
+
+/// Map `path`, then time prefill and decode separately.
+///
+/// `t_load` stops at parse. The RSS sampler starts after that, so `M_peak`
+/// is the max during allocation, prefill, and decode.
+fn weights_decode_timed(
+    path: &Path,
+    prompt: &[u32],
+    steps: usize,
+) -> Result<TimedDecode, WeightsError> {
+    let t0 = Instant::now();
     let mapped = SafeTensorsMmap::open(path)?;
     let weights = mapped.parse()?;
-    decode_bf16(&weights, BlockShape::qwen25_1_5b(), prompt, steps).map_err(WeightsError::Block)
+    let t_load = t0.elapsed();
+    let rss_after_load_kib = meter::vm_rss_kib();
+    let sampler = meter::RssSampler::start();
+    let decoded = decode_bf16_timed(&weights, BlockShape::qwen25_1_5b(), prompt, steps)
+        .map_err(WeightsError::Block)?;
+    let m_peak_kib = sampler.stop();
+    Ok(TimedDecode {
+        tokens: decoded.tokens,
+        t_load,
+        t_prefill: decoded.t_prefill,
+        t_decode: decoded.t_decode,
+        rss_after_load_kib,
+        m_peak_kib,
+    })
+}
+
+struct TimedTokens {
+    tokens: Vec<u32>,
+    t_prefill: std::time::Duration,
+    t_decode: std::time::Duration,
+}
+
+/// Prefill, then greedy-decode, with the two clocks split at the first new token.
+fn decode_bf16_timed(
+    map: &impl WeightMap,
+    shape: BlockShape,
+    prompt: &[u32],
+    steps: usize,
+) -> Result<TimedTokens, BlockError> {
+    if prompt.is_empty() {
+        return Err(BlockError::Shape);
+    }
+    let t_prefill_start = Instant::now();
+    let max_seq = decode_max_seq(prompt.len(), steps)?;
+    let mut cache = KvCache::new(KvShape {
+        num_layers: shape.num_layers,
+        num_kv_heads: shape.attn.num_kv_heads,
+        head_dim: shape.attn.head_dim,
+        max_seq,
+    })
+    .map_err(BlockError::Cache)?;
+    let mut work = BlockWorkspace::new(shape, max_seq)?;
+    prefill(prompt, map, shape, &mut cache, &mut work)?;
+    let t_prefill = t_prefill_start.elapsed();
+    let t_decode_start = Instant::now();
+    let mut decoded = Vec::new();
+    greedy_decode(steps, map, shape, &mut cache, &mut work, &mut decoded)?;
+    let t_decode = t_decode_start.elapsed();
+    Ok(TimedTokens {
+        tokens: decoded,
+        t_prefill,
+        t_decode,
+    })
 }
 
 /// `KvCache` and [`BlockWorkspace`] capacity: one slot per prompt id and per
@@ -339,22 +564,7 @@ fn decode_bf16(
     prompt: &[u32],
     steps: usize,
 ) -> Result<Vec<u32>, BlockError> {
-    if prompt.is_empty() {
-        return Err(BlockError::Shape);
-    }
-    let max_seq = decode_max_seq(prompt.len(), steps)?;
-    let mut cache = KvCache::new(KvShape {
-        num_layers: shape.num_layers,
-        num_kv_heads: shape.attn.num_kv_heads,
-        head_dim: shape.attn.head_dim,
-        max_seq,
-    })
-    .map_err(BlockError::Cache)?;
-    let mut work = BlockWorkspace::new(shape, max_seq)?;
-    prefill(prompt, map, shape, &mut cache, &mut work)?;
-    let mut decoded = Vec::new();
-    greedy_decode(steps, map, shape, &mut cache, &mut work, &mut decoded)?;
-    Ok(decoded)
+    decode_bf16_timed(map, shape, prompt, steps).map(|timed| timed.tokens)
 }
 
 /// Failure from [`weights_decode`]. Display text is the CLI's stderr tail.
@@ -407,6 +617,11 @@ fn write_cli_fingerprint(
         cmdline: cmdline_from(env::args()),
         commit,
         e2_prompt_ids: cli.prompt_ids.is_some(),
+        threads: cli.threads as u64,
+        gemv_pack: tensor_core::gemv_bf16_panel_pack(),
+        run_id: cli
+            .arena_s1
+            .then(|| format!("s1-myos-bf16-t{}", cli.threads)),
     });
     let path = write_run_fingerprint(&dir, &fp)?;
     if let Some(ids) = generated {
@@ -471,6 +686,111 @@ fn correct_line(got: &[u32], reference: &[u32]) -> String {
 fn print_correct(got: &[u32], reference: Option<&[u32]>) {
     if let Some(reference) = reference {
         println!("{}", correct_line(got, reference));
+    }
+}
+
+fn run_arena_cli(cli: &Cli) -> ExitCode {
+    let weights = match cli.weights.as_deref() {
+        Some(path) => path,
+        None => {
+            eprintln!("MyOS arena: --arena-s1 needs --weights");
+            return ExitCode::from(2);
+        }
+    };
+    let prompt_ids = match cli.prompt_ids.as_deref() {
+        Some(path) => path,
+        None => {
+            eprintln!("MyOS arena: --arena-s1 needs --prompt-ids");
+            return ExitCode::from(2);
+        }
+    };
+    let ref_ids = match cli.ref_ids.as_deref() {
+        Some(path) => path,
+        None => {
+            eprintln!("MyOS arena: --arena-s1 needs --ref-ids");
+            return ExitCode::from(2);
+        }
+    };
+    let out_dir = match &cli.fingerprint_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(format!("runs/s1-myos-bf16-t{}", cli.threads)),
+    };
+    let cost_card = match &cli.cost_card {
+        Some(path) => PathBuf::from(path),
+        None if cli.threads == tensor_core::SHOWDOWN_THREADS => {
+            PathBuf::from("arena/s1-myos-bf16-cost-card.md")
+        }
+        None => PathBuf::from(format!("arena/s1-myos-bf16-t{}-cost-card.md", cli.threads)),
+    };
+    let bin = match env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("MyOS arena: current exe: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let prompt = match load_prompt(cli) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("MyOS prompt-ids: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut fp_cli = cli.clone();
+    fp_cli.fingerprint_dir = Some(out_dir.display().to_string());
+    if let Err(err) = write_cli_fingerprint(
+        RunKind::Weights,
+        BlockShape::qwen25_1_5b(),
+        &fp_cli,
+        &prompt,
+        None,
+    ) {
+        eprintln!("MyOS fingerprint: {err}");
+        return ExitCode::from(1);
+    }
+    let commit = env::current_dir().ok().as_deref().and_then(git_commit_at);
+    let job = arena::ArenaJob {
+        bin,
+        weights: weights.to_string(),
+        prompt_ids: prompt_ids.to_string(),
+        ref_ids: ref_ids.to_string(),
+        steps: cli.steps,
+        threads: cli.threads,
+        warmup: cli.warmup,
+        repeats: cli.repeats,
+        out_dir: out_dir.clone(),
+        cost_card: cost_card.clone(),
+        cmdline: cmdline_from(env::args()),
+        commit,
+    };
+    match arena::run(&job) {
+        Ok(report) => {
+            println!(
+                "ARENA S1 threads={} W={} R={} CORRECT={} DET={} comparable={} scene={} T_decode={:.4} L_TTFT_ms={:.3} L_TPOT_ms={:.3} M_peak_MiB={:.3}",
+                cli.threads,
+                cli.warmup,
+                cli.repeats,
+                if report.correct_pass { "PASS" } else { "FAIL" },
+                if report.det_pass { "PASS" } else { "FAIL" },
+                report.comparable,
+                report.scene.as_str(),
+                report.medians.t_decode_tok_s,
+                report.medians.l_ttft_ms,
+                report.medians.l_tpot_ms,
+                report.medians.m_peak_mib
+            );
+            println!("cost-card: {}", cost_card.display());
+            println!("run-dir: {}", out_dir.display());
+            if report.correct_pass && report.det_pass {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(err) => {
+            eprintln!("MyOS arena: {err}");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -563,6 +883,11 @@ mod tests {
         assert_eq!(empty.weights, None);
         assert!(!empty.block_fixture);
         assert_eq!(empty.steps, SMOKE_STEPS);
+        assert_eq!(empty.threads, tensor_core::SHOWDOWN_THREADS);
+        assert_eq!(empty.threads, 8);
+        assert!(!empty.arena_s1);
+        assert_eq!(empty.warmup, 3);
+        assert_eq!(empty.repeats, 5);
         assert_eq!(empty.fingerprint_dir, None);
         assert_eq!(empty.prompt_ids, None);
         assert_eq!(empty.ref_ids, None);
@@ -626,6 +951,39 @@ mod tests {
         assert!(parse_cli(["--ref-ids"]).is_err());
         assert!(parse_cli(["--ref-ids="]).is_err());
         assert!(parse_cli(["--ref-ids", "a", "--ref-ids", "b"]).is_err());
+        assert_eq!(parse_cli(["--threads", "8"]).unwrap().threads, 8);
+        assert_eq!(parse_cli(["--threads=1"]).unwrap().threads, 1);
+        assert!(parse_cli(["--threads", "0"]).is_err());
+        assert!(parse_cli(["--threads", "65"]).is_err());
+        assert!(parse_cli(["--threads"]).is_err());
+        assert!(parse_cli(["--warmup", "1"]).is_err());
+        assert!(parse_cli(["--arena-s1"]).is_err());
+        let arena = parse_cli([
+            "--arena-s1",
+            "--weights",
+            "m.safetensors",
+            "--prompt-ids",
+            "p.txt",
+            "--ref-ids",
+            "r.txt",
+        ])
+        .unwrap();
+        assert!(arena.arena_s1);
+        assert_eq!(arena.steps, 128);
+        assert_eq!(arena.threads, 8);
+        assert_eq!(arena.warmup, 3);
+        assert_eq!(arena.repeats, 5);
+        assert!(parse_cli([
+            "--arena-s1",
+            "--weights",
+            "m.safetensors",
+            "--prompt-ids",
+            "p.txt",
+            "--ref-ids",
+            "r.txt",
+            "--block-fixture",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -639,6 +997,9 @@ mod tests {
             cmdline: cmdline_from(["myos", "--weights", "model.safetensors"]),
             commit: Some("abc".to_string()),
             e2_prompt_ids: false,
+            threads: 8,
+            gemv_pack: false,
+            run_id: None,
         });
         assert_eq!(
             weights.model_id.as_deref(),
@@ -653,7 +1014,8 @@ mod tests {
         assert_eq!(weights.acc_path, "bf16_w_fp32_acc");
         assert!(weights.deterministic);
         assert_eq!(weights.device, "cpu");
-        assert_eq!(weights.threads, 1);
+        assert_eq!(weights.threads, 8);
+        assert!(!weights.gemv_pack);
         assert_eq!(weights.batch, 1);
         assert_eq!(weights.n_prompt, 1);
         assert_eq!(weights.n_gen, 4);
@@ -678,6 +1040,9 @@ mod tests {
             cmdline: String::new(),
             commit: None,
             e2_prompt_ids: true,
+            threads: 8,
+            gemv_pack: false,
+            run_id: None,
         });
         assert_eq!(e2.n_prompt, 128);
         assert_eq!(e2.n_gen, 128);
@@ -694,6 +1059,9 @@ mod tests {
             cmdline: String::new(),
             commit: None,
             e2_prompt_ids: false,
+            threads: 1,
+            gemv_pack: false,
+            run_id: None,
         });
         assert_eq!(tiny.model_id, None);
         assert_eq!(tiny.layout, "not-qwen25-1.5b");
@@ -709,6 +1077,9 @@ mod tests {
             cmdline: "myos --block-fixture \"a b\"".to_string(),
             commit: None,
             e2_prompt_ids: false,
+            threads: 8,
+            gemv_pack: false,
+            run_id: None,
         });
         assert_eq!(fixture.model_id, None);
         assert_eq!(fixture.fmt, "in-process");
@@ -725,6 +1096,8 @@ mod tests {
         assert!(json.contains("\"model_sha256\": null"));
         assert!(json.contains("\"seed\": null"));
         assert!(json.contains("\"device\": \"cpu\""));
+        assert!(json.contains("\"threads\": 8"));
+        assert!(json.contains("\"gemv_pack\": false"));
         assert!(json.contains("\"scenario_id\": \"S1\""));
         let model_id = json.find("\"model_id\"").unwrap();
         let sha = json.find("\"model_sha256\"").unwrap();
@@ -939,9 +1312,14 @@ mod tests {
             weights: Some("model.safetensors".to_string()),
             block_fixture: false,
             steps: 128,
+            threads: 8,
             fingerprint_dir: Some(dir.display().to_string()),
             prompt_ids: Some("s1_prompt.token_ids.txt".to_string()),
             ref_ids: None,
+            arena_s1: false,
+            warmup: 3,
+            repeats: 5,
+            cost_card: None,
         };
         let prompt = [7u32, 8, 9];
         let generated = [1u32, 1, 1];

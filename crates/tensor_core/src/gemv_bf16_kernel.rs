@@ -16,15 +16,31 @@
 //! than this strided kernel, and it did not reach 2×. Software prefetch of
 //! the next column group stays on unless [`set_gemv_bf16_prefetch`] is
 //! passed `false`.
+//!
+//! Row-parallel workers live outside this file. They call [`gemv_bf16_rows`]
+//! on a contiguous span from [`gemv_row_spans`]. A span does not share an
+//! accumulator with another span.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::bf16_le_to_f32;
+
+/// Showdown `n_threads`. Matches llama.cpp S1 BF16 `-t 8`.
+pub const SHOWDOWN_THREADS: usize = 8;
+
+/// Upper bound for [`set_gemv_bf16_threads`]. The row-span table is this long.
+pub const GEMV_THREADS_MAX: usize = 64;
+
+/// AVX2 panel width. Spans use whole panels when every worker can take one.
+const ROW_PANEL: usize = 32;
 
 /// Off by default. See the module docs.
 static PANEL_PACK: AtomicBool = AtomicBool::new(false);
 /// On by default. The prefetches are the ones already in the strided kernel.
 static PREFETCH: AtomicBool = AtomicBool::new(true);
+/// Workers for the next [`crate::gemv_bf16`] call. The host sets this from
+/// `--threads`. Default is the showdown width, not 1.
+static GEMV_THREADS: AtomicUsize = AtomicUsize::new(SHOWDOWN_THREADS);
 
 /// `true`: pack each 32-row tile into column-major scratch before the dot.
 ///
@@ -43,8 +59,103 @@ fn panel_pack_enabled() -> bool {
     PANEL_PACK.load(Ordering::Relaxed)
 }
 
+/// `true` when the knife-6 panel pack is on. Default is `false`.
+pub fn gemv_bf16_panel_pack() -> bool {
+    panel_pack_enabled()
+}
+
 fn prefetch_enabled() -> bool {
     PREFETCH.load(Ordering::Relaxed)
+}
+
+/// Worker count for the next host GEMV. Clamped to `1..=GEMV_THREADS_MAX`.
+///
+/// `0` becomes 1. Values above [`GEMV_THREADS_MAX`] become that max. The CLI
+/// rejects both instead of clamping, so a fingerprint cannot advertise a
+/// width the pool will not run.
+pub fn set_gemv_bf16_threads(n: usize) {
+    GEMV_THREADS.store(n.clamp(1, GEMV_THREADS_MAX), Ordering::Relaxed);
+}
+
+/// Worker count stored by [`set_gemv_bf16_threads`]. Default [`SHOWDOWN_THREADS`].
+pub fn gemv_bf16_threads() -> usize {
+    GEMV_THREADS
+        .load(Ordering::Relaxed)
+        .clamp(1, GEMV_THREADS_MAX)
+}
+
+/// Contiguous `[start, end)` row spans, deterministic in `(m, threads)`.
+///
+/// When at least one 32-row panel fits on every worker, spans are whole
+/// panels and the last span also takes `m % 32` leftover rows. Otherwise
+/// rows are split as evenly as possible; the first `m % threads` spans get
+/// one extra row. Empty spans are not emitted. `threads` is clamped to
+/// `1..=min(m, GEMV_THREADS_MAX)`.
+#[derive(Clone, Copy)]
+pub struct GemvRowSpans {
+    spans: [(usize, usize); GEMV_THREADS_MAX],
+    len: u8,
+}
+
+impl GemvRowSpans {
+    pub fn as_slice(&self) -> &[(usize, usize)] {
+        &self.spans[..self.len as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
+impl core::fmt::Debug for GemvRowSpans {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+pub fn gemv_row_spans(m: usize, threads: usize) -> GemvRowSpans {
+    let mut out = GemvRowSpans {
+        spans: [(0, 0); GEMV_THREADS_MAX],
+        len: 0,
+    };
+    if m == 0 {
+        return out;
+    }
+    let threads = threads.clamp(1, GEMV_THREADS_MAX).min(m);
+    let panels = m / ROW_PANEL;
+    if panels >= threads {
+        let base = panels / threads;
+        let extra = panels % threads;
+        let tail = m % ROW_PANEL;
+        let mut row = 0usize;
+        for t in 0..threads {
+            let n_panels = base + usize::from(t < extra);
+            let mut n_rows = n_panels * ROW_PANEL;
+            if t + 1 == threads {
+                n_rows += tail;
+            }
+            let end = row + n_rows;
+            out.spans[out.len as usize] = (row, end);
+            out.len += 1;
+            row = end;
+        }
+        debug_assert_eq!(row, m);
+        return out;
+    }
+    let base = m / threads;
+    let rem = m % threads;
+    let mut row = 0usize;
+    for t in 0..threads {
+        let n = base + usize::from(t < rem);
+        if n == 0 {
+            break;
+        }
+        out.spans[out.len as usize] = (row, row + n);
+        out.len += 1;
+        row += n;
+    }
+    debug_assert_eq!(row, m);
+    out
 }
 
 /// Dispatch. `w`, `x`, and `y` match a validated [`crate::gemv_bf16`] call
@@ -995,7 +1106,9 @@ mod tests {
             let reps = 4000usize;
             let fast = elapsed_secs(3, || {
                 for _ in 0..reps {
-                    gemv_bf16(&mut y_fast, &w, &x, m, k).unwrap();
+                    // threads=1 kernel. The public `gemv_bf16` path is the
+                    // row pool; this bench stays the single-thread SIMD floor.
+                    super::gemv_bf16_rows(&mut y_fast, &w, &x);
                 }
                 std::hint::black_box(&y_fast);
             });
@@ -1031,7 +1144,7 @@ mod tests {
             let mut y_prev = vec![0.0f32; m];
             let mut y_naive = vec![0.0f32; m];
             let fast = elapsed_secs(3, || {
-                gemv_bf16(&mut y_fast, &w, &x, m, k).unwrap();
+                super::gemv_bf16_rows(&mut y_fast, &w, &x);
                 std::hint::black_box(&y_fast);
             });
             // Knife 5a: the 16-row XMM kernel, still in this file as the tail.
@@ -1083,5 +1196,200 @@ mod tests {
                 "{name} speedup {speedup:.2}x, want >= 2.5x versus the naive loop"
             );
         }
+    }
+
+    #[test]
+    fn showdown_default_is_eight_threads_and_pack_starts_off() {
+        assert_eq!(super::SHOWDOWN_THREADS, 8);
+        assert_eq!(super::GEMV_THREADS_MAX, 64);
+        // The atomic is initialized to the showdown width. Tests in this
+        // file do not call `set_gemv_bf16_threads`.
+        assert_eq!(super::gemv_bf16_threads(), 8);
+    }
+
+    #[test]
+    fn row_spans_cover_qwen_shapes_without_gaps() {
+        fn assert_cover(m: usize, threads: usize, expect: &[(usize, usize)]) {
+            let spans = super::gemv_row_spans(m, threads);
+            assert_eq!(spans.as_slice(), expect, "m={m} threads={threads}");
+            if m == 0 {
+                return;
+            }
+            assert_eq!(spans.as_slice().first().unwrap().0, 0);
+            assert_eq!(spans.as_slice().last().unwrap().1, m);
+            for pair in spans.as_slice().windows(2) {
+                assert_eq!(pair[0].1, pair[1].0);
+                assert!(pair[0].0 < pair[0].1);
+            }
+        }
+        assert_cover(0, 8, &[]);
+        assert_cover(1, 8, &[(0, 1)]);
+        assert_cover(4, 8, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+        // 32 rows is one panel, which is fewer panels than 8 workers, so the
+        // split is by rows (4 each), not by panel.
+        assert_cover(
+            32,
+            8,
+            &[
+                (0, 4),
+                (4, 8),
+                (8, 12),
+                (12, 16),
+                (16, 20),
+                (20, 24),
+                (24, 28),
+                (28, 32),
+            ],
+        );
+        let mut kv = [(0, 0); 8];
+        for t in 0..8 {
+            kv[t] = (t * 32, (t + 1) * 32);
+        }
+        assert_cover(256, 8, &kv);
+        let mut q = [(0, 0); 8];
+        for t in 0..8 {
+            q[t] = (t * 192, (t + 1) * 192);
+        }
+        assert_cover(1536, 8, &q);
+        let mut gate = [(0, 0); 8];
+        for t in 0..8 {
+            gate[t] = (t * 1120, (t + 1) * 1120);
+        }
+        assert_cover(8960, 8, &gate);
+        // 151936 / 32 = 4748 panels. 4748 = 8*593 + 4, so the first four
+        // workers take one extra panel. No tail rows.
+        let wide = 594 * 32;
+        let narrow = 593 * 32;
+        let mut head = [(0, 0); 8];
+        let mut row = 0;
+        for t in 0..8 {
+            let n = if t < 4 { wide } else { narrow };
+            head[t] = (row, row + n);
+            row += n;
+        }
+        assert_eq!(row, 151936);
+        assert_cover(151936, 8, &head);
+        assert_cover(65, 2, &[(0, 32), (32, 65)]);
+        assert_cover(7, 3, &[(0, 3), (3, 5), (5, 7)]);
+        assert_cover(40, 1, &[(0, 40)]);
+        assert_cover(40, 0, &[(0, 40)]);
+    }
+
+    #[test]
+    fn row_parallel_matches_scalar_cancellation_and_naive() {
+        let big = 16_777_216.0f32;
+        let pattern = [big, 1.0, 1.0, 1.0, -big, 1.0, 1.0, 1.0];
+        let row = pack(&pattern);
+        let x = [1.0f32; 8];
+        for m in [1usize, 7, 8, 9, 17, 31, 32, 33, 48, 64, 256] {
+            let mut w = Vec::with_capacity(m * row.len());
+            for _ in 0..m {
+                w.extend_from_slice(&row);
+            }
+            let mut y1 = vec![0.0f32; m];
+            let mut y8 = vec![9.0f32; m];
+            crate::bf16::gemv_bf16_at_threads(&mut y1, &w, &x, m, 8, 1).unwrap();
+            crate::bf16::gemv_bf16_at_threads(&mut y8, &w, &x, m, 8, 8).unwrap();
+            assert!(
+                y1.iter().all(|v| v.to_bits() == 3.0f32.to_bits()),
+                "m={m} serial lost the left-to-right chain"
+            );
+            assert_same_bits(&y8, &y1);
+        }
+
+        let shapes = [
+            (15, 17),
+            (32, 64),
+            (33, 40),
+            (48, 31),
+            (64, 128),
+            (96, 63),
+            (128, 64),
+            (256, 48),
+        ];
+        for threads in [1usize, 2, 3, 7, 8] {
+            for (i, (m, k)) in shapes.iter().copied().enumerate() {
+                let (w, x) = patterned(m, k, 0x1700 ^ (i as u32) ^ ((threads as u32) << 8));
+                let mut expect = vec![0.0f32; m];
+                naive(&mut expect, &w, &x);
+                let mut got = vec![1.0f32; m];
+                crate::bf16::gemv_bf16_at_threads(&mut got, &w, &x, m, k, threads).unwrap();
+                assert_same_bits(&got, &expect);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_callers_do_not_mix_rows() {
+        let (w1, x1) = patterned(48, 32, 1);
+        let (w2, x2) = patterned(48, 32, 2);
+        let mut y1 = vec![0.0f32; 48];
+        let mut y2 = vec![0.0f32; 48];
+        let mut n1 = vec![0.0f32; 48];
+        let mut n2 = vec![0.0f32; 48];
+        naive(&mut n1, &w1, &x1);
+        naive(&mut n2, &w2, &x2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                crate::bf16::gemv_bf16_at_threads(&mut y1, &w1, &x1, 48, 32, 8).unwrap();
+            });
+            scope.spawn(|| {
+                crate::bf16::gemv_bf16_at_threads(&mut y2, &w2, &x2, 48, 32, 8).unwrap();
+            });
+        });
+        assert_same_bits(&y1, &n1);
+        assert_same_bits(&y2, &n2);
+    }
+
+    /// Knife 6 pack stays off. Turning it on under the row pool still matches
+    /// the scalar chain. The flag is process-global; both pack and the
+    /// strided kernel match `naive`, so a racing restore cannot change bits.
+    #[test]
+    fn packed_rows_under_eight_threads_match_naive() {
+        let (w, x) = normal_panel(96, 80, 9);
+        let mut expect = vec![0.0f32; 96];
+        naive(&mut expect, &w, &x);
+        super::set_gemv_bf16_panel_pack(true);
+        let mut got = vec![0.0f32; 96];
+        let result = crate::bf16::gemv_bf16_at_threads(&mut got, &w, &x, 96, 80, 8);
+        super::set_gemv_bf16_panel_pack(false);
+        result.unwrap();
+        assert_same_bits(&got, &expect);
+    }
+
+    /// Soft record: threads=8 versus threads=1 on the gate/up shape.
+    /// Not a ≥2× gate. Debug builds skip the timing.
+    #[test]
+    fn release_gate_threads8_versus_threads1() {
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let (m, k) = (INTERMEDIATE_SIZE_QWEN25_1_5B, HIDDEN_SIZE_QWEN25_1_5B);
+        let (w, x) = normal_panel(m, k, 0x77);
+        let mut y1 = vec![0.0f32; m];
+        let mut y8 = vec![0.0f32; m];
+        let reps = 4usize;
+        let t1 = elapsed_secs(3, || {
+            for _ in 0..reps {
+                crate::bf16::gemv_bf16_at_threads(&mut y1, &w, &x, m, k, 1).unwrap();
+            }
+            std::hint::black_box(&y1);
+        });
+        let t8 = elapsed_secs(3, || {
+            for _ in 0..reps {
+                crate::bf16::gemv_bf16_at_threads(&mut y8, &w, &x, m, k, 8).unwrap();
+            }
+            std::hint::black_box(&y8);
+        });
+        assert_same_bits(&y8, &y1);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0);
+        eprintln!(
+            "knife7_gemv_threads gate_up [{m}, {k}]: threads1_x{reps} {t1:.6}s threads8_x{reps} {t8:.6}s speedup {:.3}x per_call_1 {:.6}s per_call_8 {:.6}s cores={cores}",
+            t1 / t8,
+            t1 / reps as f64,
+            t8 / reps as f64
+        );
     }
 }

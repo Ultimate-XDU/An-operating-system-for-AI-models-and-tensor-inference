@@ -29,20 +29,25 @@ cargo run -p myos_runtime
 
 `--weights PATH` (knife ④) maps that SafeTensors file and greedy-decodes it at `BlockShape::qwen25_1_5b` (28 layers, hidden 1536, vocab 151936). Without `--prompt-ids` the prompt is the single token id 0. The default step count is 4. Success prints `MyOS Phase1 weights decode (prompt=0, steps=4): [...]` and writes `runs/s1-weights/run_fingerprint.json`. This binary does not download weights. A missing file, a file that is not SafeTensors, or a file whose tensors are not that BF16 layout exits before any decode line and does not fall through to the cycle.
 
-`--prompt-ids PATH` (with `--weights`) reads whitespace-separated `u32` prompt ids, prefills all of them, then greedy-decodes `--steps` tokens. `max_seq` is `prompt.len() + steps`. Protocol S1 is `--steps 128` on a 128-id file. The fingerprint records that `n_prompt` and `n_gen`, and the run dir also gets `token_ids.txt` (space-separated generated ids). An empty file is an error. `--ref-ids PATH` compares those generated ids and prints `CORRECT: PASS` or `CORRECT: FAIL first_diff@i: got=X ref=Y` (length mismatch is its own FAIL line). A mismatch still exits 0.
+`--threads N` is the GEMV worker count (default **8**, the llama S1 BF16 `-t 8` fingerprint). `1..=64`. The fingerprint records that number. `batch` stays 1. Rows are split deterministically; each row is still a left-to-right multiply-then-add. `--threads 1` is the old single-thread kernel and is not a showdown against `-t 8`.
+
+`--prompt-ids PATH` (with `--weights`) reads whitespace-separated `u32` prompt ids, prefills all of them, then greedy-decodes `--steps` tokens. `max_seq` is `prompt.len() + steps`. Protocol S1 is `--steps 128` on a 128-id file. The fingerprint records that `n_prompt` and `n_gen`, and the run dir also gets `token_ids.txt` (space-separated generated ids) plus `metrics.json` (`t_load`, `t_prefill`, `t_decode`, `M_peak`). An empty file is an error. `--ref-ids PATH` compares those generated ids and prints `CORRECT: PASS` or `CORRECT: FAIL first_diff@i: got=X ref=Y` (length mismatch is its own FAIL line). A mismatch still exits 0.
+
+`--arena-s1` (with `--weights`, `--prompt-ids`, and `--ref-ids`) is the S1 showdown parent. It does not decode itself. It spawns this binary `W + R` times (default `--warmup 3 --repeats 5`), discards the warmup, and writes medians to `runs/s1-myos-bf16-t<N>/` and `arena/s1-myos-bf16-cost-card.md` when `N` is 8. `--steps` defaults to 128 in this mode. `MYOS_GEMV_PACK` stays off unless you set it; the showdown card treats pack-on as not comparable.
 
 ```
 cargo run -p myos_runtime -- --weights path/to/model.safetensors
 cargo run -p myos_runtime -- --weights path/to/model.safetensors --steps 4
 MYOS_WEIGHTS=path/to/model.safetensors cargo run -p myos_runtime
-cargo run -p myos_runtime -- --weights path/to/model.safetensors --prompt-ids arena/prompts/s1_prompt.token_ids.txt --steps 128 --ref-ids runs/s1-llamacpp-bf16-b11960/token_ids.txt --fingerprint-dir runs/e2-myos-s1
+cargo run -p myos_runtime -- --weights path/to/model.safetensors --prompt-ids arena/prompts/s1_prompt.token_ids.txt --steps 128 --threads 8 --ref-ids runs/s1-llamacpp-bf16-b11960/token_ids.txt --fingerprint-dir runs/e2-myos-s1
+cargo run -p myos_runtime --release -- --arena-s1 --weights path/to/model.safetensors --prompt-ids arena/prompts/s1_prompt.token_ids.txt --ref-ids runs/s1-llamacpp-bf16-b11960/token_ids.txt --threads 8
 ```
 
 `--weights` wins over `MYOS_WEIGHTS` when both are set. `--block-fixture` still runs the in-process fixture when that flag is set. If a weights path is also set, the file is only checked as SafeTensors; its tensors are not the fixture. A bad path still exits before the fixture line.
 
 `--fingerprint-dir DIR` writes `DIR/run_fingerprint.json` instead of `runs/<id>/`. It needs `--weights` or `--block-fixture`.
 
-The fingerprint is host-only. It records the protocol §1.3 fields this process knows, plus `quant_or_dtype=bf16` and `acc_path=bf16_w_fp32_acc`. `model_sha256` and `seed` are JSON null (the file is not hashed, and greedy argmax has no RNG). `scenario_id` is `S1`. Without `--prompt-ids`, `n_prompt` is 1. With `--prompt-ids`, `n_prompt` is the file length, `n_gen` is `--steps`, and the notes say this is the E2 multi-token path. `prompt_token` is the first prompt id. `commit` is git HEAD when a `.git` directory is visible from the working directory, otherwise null. The fingerprint file is not itself a llama.cpp exact result; `--ref-ids` prints the CORRECT gate. `runs/` is gitignored.
+The fingerprint is host-only. It records the protocol §1.3 fields this process knows, plus `quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc`, and `gemv_pack` (false unless `MYOS_GEMV_PACK=1`). `threads` is `--threads` (default 8). `model_sha256` and `seed` are JSON null (the file is not hashed, and greedy argmax has no RNG). `scenario_id` is `S1`. Without `--prompt-ids`, `n_prompt` is 1. With `--prompt-ids`, `n_prompt` is the file length, `n_gen` is `--steps`, and the notes say this is the E2 multi-token path. `prompt_token` is the first prompt id. `commit` is git HEAD when a `.git` directory is visible from the working directory, otherwise null. The fingerprint file is not itself a llama.cpp exact result; `--ref-ids` prints the CORRECT gate. `runs/` is gitignored. The showdown ledger is `arena/phase1-scoreboard.md` and `arena/s1-myos-bf16-cost-card.md`. On a machine without the 1.5B weights those MyOS medians stay UNMEASURED.
 
 ## SafeTensors loader
 
@@ -114,7 +119,7 @@ Each slot is `[kv_head, pos, head_dim]` with a `max_seq` stride. The layer packs
 
 ## Feature flags
 
-`weight_loader` is `no_std` + `alloc` by default. `tensor_core` and `model_core` depend on that default and do not enable host I/O.
+`weight_loader` is `no_std` + `alloc` by default. `tensor_core` is `no_std` unless the `std` feature is on. `myos_runtime` turns that feature on for the GEMV row pool only. `model_core` stays `no_std` and does not enable host I/O.
 
 | Feature | When | What it adds |
 | --- | --- | --- |

@@ -46,6 +46,12 @@ pub struct RunSpec {
     pub commit: Option<String>,
     /// Set when `--prompt-ids` supplied the prompt for this run.
     pub e2_prompt_ids: bool,
+    /// CLI `--threads`. Showdown default is 8.
+    pub threads: u64,
+    /// Knife-6 panel pack. Showdown keeps this false.
+    pub gemv_pack: bool,
+    /// Replaces `kind.id()` when this process is the S1 showdown directory.
+    pub run_id: Option<String>,
 }
 
 /// Protocol §1.3, plus the BF16 accumulate path this tree already pinned.
@@ -65,6 +71,8 @@ pub struct RunFingerprint {
     pub n_gen: u64,
     pub batch: u64,
     pub threads: u64,
+    /// Knife-6 runtime panel pack. Default showdown value is false.
+    pub gemv_pack: bool,
     pub device: String,
     pub deterministic: bool,
     pub seed: Option<u64>,
@@ -86,7 +94,9 @@ model_sha256 is null: this process does not hash the file and does not copy the 
 seed is null: greedy argmax has no RNG. \
 scenario_id S1 is a placeholder; n_prompt, n_gen, and n_ctx are this process, not protocol S1 (n_prompt=128, n_gen=128, n_ctx>=512). \
 model_id is set only when layout is qwen25_1_5b. \
-threads is 1 and batch is 1 because this loop is one thread and one token at a time. \
+threads is the --threads value (showdown default 8, the same n_threads as llama S1 BF16 -t 8). batch is 1. \
+gemv_pack is false unless MYOS_GEMV_PACK=1; knife-6 panel pack is not the default path. \
+quant_or_dtype stays bf16 and acc_path stays bf16_w_fp32_acc (no whole-table f32). \
 This file is not a llama.cpp exact comparison.";
 
 const NOTES_E2: &str = "\
@@ -96,7 +106,9 @@ E2-capable multi-token path: --prompt-ids is prefilled in order, then greedy --s
 n_prompt is that file's length and n_gen is --steps (protocol S1 is n_prompt=128, n_gen=128). \
 n_ctx is n_prompt + n_gen, the KvCache max_seq for this process. \
 model_id is set only when layout is qwen25_1_5b. \
-threads is 1 and batch is 1 because this loop is one thread and one token at a time. \
+threads is the --threads value (showdown default 8, the same n_threads as llama S1 BF16 -t 8). batch is 1. \
+gemv_pack is false unless MYOS_GEMV_PACK=1; knife-6 panel pack is not the default path. \
+quant_or_dtype stays bf16 and acc_path stays bf16_w_fp32_acc (no whole-table f32). \
 --ref-ids prints CORRECT. This fingerprint file is not itself a llama.cpp exact comparison.";
 
 impl RunFingerprint {
@@ -122,14 +134,15 @@ impl RunFingerprint {
             n_prompt: spec.n_prompt,
             n_gen,
             batch: 1,
-            threads: 1,
+            threads: spec.threads,
+            gemv_pack: spec.gemv_pack,
             device: "cpu".to_string(),
             deterministic: true,
             seed: None,
             commit: spec.commit,
             cmdline: spec.cmdline,
             scenario_id: "S1".to_string(),
-            run_id: spec.kind.id().to_string(),
+            run_id: spec.run_id.unwrap_or_else(|| spec.kind.id().to_string()),
             layout: layout.to_string(),
             num_layers: spec.shape.num_layers as u64,
             hidden_size: spec.shape.attn.hidden as u64,
@@ -161,6 +174,7 @@ impl RunFingerprint {
             ("n_gen", self.n_gen.to_string()),
             ("batch", self.batch.to_string()),
             ("threads", self.threads.to_string()),
+            ("gemv_pack", bool_json(self.gemv_pack)),
             ("device", json_string(&self.device)),
             ("deterministic", bool_json(self.deterministic)),
             ("seed", json_opt_u64(self.seed)),

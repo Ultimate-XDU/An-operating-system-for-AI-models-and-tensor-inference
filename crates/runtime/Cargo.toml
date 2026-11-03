@@ -11,7 +11,8 @@ path = "src/main.rs"
 [dependencies]
 model_core = { path = "../model_core" }
 # Fingerprint strings `quant_or_dtype` and `acc_path`. Not a new numeric path.
-tensor_core = { path = "../tensor_core" }
+# `std` is the row-parallel GEMV pool. Numeric kernels stay no_std.
+tensor_core = { path = "../tensor_core", features = ["std"] }
 # Host-only file map. `model_core` keeps the default `no_std` weight_loader.
 weight_loader = { path = "../weight_loader", features = ["host"] }
 

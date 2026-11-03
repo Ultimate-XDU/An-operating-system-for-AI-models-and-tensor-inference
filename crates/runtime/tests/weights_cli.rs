@@ -117,7 +117,8 @@ fn assert_bf16_fingerprint(json: &str) {
     assert!(json.contains("\"model_sha256\": null"), "{json}");
     assert!(json.contains("\"seed\": null"), "{json}");
     assert!(json.contains("\"scenario_id\": \"S1\""), "{json}");
-    assert!(json.contains("\"threads\": 1"), "{json}");
+    assert!(json.contains("\"threads\": 8"), "{json}");
+    assert!(json.contains("\"gemv_pack\": false"), "{json}");
     assert!(json.contains("\"batch\": 1"), "{json}");
 }
 
@@ -346,7 +347,7 @@ fn unknown_argument_is_usage() {
     assert_eq!(code, 2);
     assert!(err.contains("unknown argument"));
     assert!(err.contains(
-        "usage: myos [--weights PATH] [--block-fixture] [--steps N] [--fingerprint-dir DIR] [--prompt-ids PATH] [--ref-ids PATH]"
+        "usage: myos [--weights PATH] [--block-fixture] [--steps N] [--threads N] [--fingerprint-dir DIR] [--prompt-ids PATH] [--ref-ids PATH] [--arena-s1] [--warmup N] [--repeats N] [--cost-card PATH]"
     ));
     assert_eq!(out, "");
 }
@@ -458,6 +459,46 @@ fn ref_ids_on_block_fixture_prints_correct_and_exits_zero() {
         out.contains("CORRECT: FAIL length mismatch got=4 ref=2"),
         "{out}"
     );
+}
+
+#[test]
+fn threads_flag_is_recorded_and_does_not_change_block_fixture_tokens() {
+    let eight = Scratch::new("threads-8");
+    let one = Scratch::new("threads-1");
+    let (ok8, _, out8, err8) = stdout(myos(eight.path()).args(["--block-fixture", "--threads", "8"]));
+    let (ok1, _, out1, err1) = stdout(myos(one.path()).args(["--block-fixture", "--threads", "1"]));
+    assert!(ok8, "{err8}");
+    assert!(ok1, "{err1}");
+    assert_eq!(out8, out1);
+    assert_eq!(out8, "MyOS Phase1 block fixture (prompt=0): [1, 1, 1, 1]\n");
+    let json8 = std::fs::read_to_string(
+        eight
+            .path()
+            .join("runs/s1-block-fixture/run_fingerprint.json"),
+    )
+    .unwrap();
+    let json1 = std::fs::read_to_string(
+        one.path()
+            .join("runs/s1-block-fixture/run_fingerprint.json"),
+    )
+    .unwrap();
+    assert!(json8.contains("\"threads\": 8"), "{json8}");
+    assert!(json1.contains("\"threads\": 1"), "{json1}");
+    assert!(json8.contains("\"gemv_pack\": false"), "{json8}");
+    assert!(json8.contains("\"batch\": 1"), "{json8}");
+    assert!(json8.contains("\"quant_or_dtype\": \"bf16\""), "{json8}");
+    assert!(json8.contains("\"acc_path\": \"bf16_w_fp32_acc\""), "{json8}");
+}
+
+#[test]
+fn arena_s1_without_weights_is_usage() {
+    let dir = Scratch::new("arena-usage");
+    let (ok, code, out, err) = stdout(myos(dir.path()).arg("--arena-s1"));
+    assert!(!ok);
+    assert_eq!(code, 2);
+    assert!(err.contains("--arena-s1 needs --weights"), "{err}");
+    assert_eq!(out, "");
+    assert!(!dir.path().join("arena").exists());
 }
 
 #[test]
