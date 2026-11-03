@@ -1,0 +1,7 @@
+{
+  "n_prompt_target": 128,
+  "n_prompt_measured_tokenize": 128,
+  "system": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+  "wrap": "llama-cli default Qwen chat template (jinja on): system+user+assistant header",
+  "file_contains": "user message body only (UTF-8); CLI applies chat template"
+}

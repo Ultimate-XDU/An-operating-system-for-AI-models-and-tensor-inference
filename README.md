@@ -12,6 +12,7 @@ AI-Native Runtime：面向大模型与张量推理的极简 Unikernel。
 - ModelCore（类型安全模型抽象）
 - 最小推理循环（prefill + decode，CPU）
 - 对打协议：见 `PHASE1-ARENA-PROTOCOL-v0.1.md`
+- E2 S1 CORRECT PASS：实现笔记 `arena/e2-s1-myos-exact.md`；正式账本 `arena/e2-s1-correct.md`；总览 `arena/phase1-scoreboard.md`
 - 布局钉死：见 `docs/qwen25-1.5b-instruct-layout.md`
 - BF16 计算策略：见 `docs/phase1-bf16-compute-strategy.md`
 
