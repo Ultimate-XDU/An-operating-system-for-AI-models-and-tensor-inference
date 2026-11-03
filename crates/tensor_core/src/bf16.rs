@@ -65,7 +65,13 @@ pub fn bf16_le_to_f32(le: [u8; 2]) -> f32 {
 /// `y[i] = sum_j bf16_to_f32(W[i, j]) * x[j]`.
 ///
 /// `w` is row-major little-endian BF16, `m` rows by `k` columns, `2 * m * k` bytes.
-/// `x` and `y` are f32. The sum is f32, left to right across the row.
+/// `x` and `y` are f32. The sum is f32, left to right across the row:
+/// `acc += promoted_weight * x[j]` (multiply, then add; not [`f32::mul_add`]).
+///
+/// The hot path may accumulate several rows in one pass, and it uses AVX2
+/// when the CPU supports it. Each row still walks `j` from `0` to `k - 1`
+/// in that order, so the f32 bits match a scalar left-to-right loop.
+/// Weights stay a byte view: this does not build an f32 copy of `w`.
 pub fn gemv_bf16(
     y: &mut [f32],
     w: &[u8],
@@ -91,16 +97,7 @@ pub fn gemv_bf16(
     if w.len() != need {
         return Err(Bf16OpError::Shape);
     }
-    for i in 0..m {
-        let row = &w[i * row_bytes..(i + 1) * row_bytes];
-        let mut acc = 0.0f32;
-        for j in 0..k {
-            let mut le = [0u8; 2];
-            le.copy_from_slice(&row[j * 2..j * 2 + 2]);
-            acc += bf16_le_to_f32(le) * x[j];
-        }
-        y[i] = acc;
-    }
+    crate::gemv_bf16_kernel::gemv_bf16_rows(y, w, x);
     Ok(())
 }
 
@@ -330,6 +327,20 @@ mod tests {
         // row0 = 1 - 4 + 0.25 = -2.75; row1 = -1 - 8 + 0.75 = -8.25
         assert_eq!(y_bf16, [-2.75, -8.25]);
         assert_eq!(y_bf16, y_f32);
+    }
+
+    #[test]
+    fn gemv_bf16_zero_k_fills_zero_and_rejects_slack_bytes() {
+        let mut y = [1.0f32, 2.0];
+        gemv_bf16(&mut y, &[], &[], 2, 0).unwrap();
+        assert_eq!(y, [0.0, 0.0]);
+
+        let mut kept = [1.0f32];
+        assert_eq!(
+            gemv_bf16(&mut kept, &[0x00], &[], 1, 0),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(kept, [1.0]);
     }
 
     #[test]
