@@ -1,27 +1,27 @@
-# Phase1 底座候选：硬短板 × 创新切口 × fork 建议
+# Phase1 底座候选：硬短板 × 创新切口 × 主底座决议
 
 | 项 | 内容 |
 |----|------|
 | 文档 | `docs/phase1-base-fork-gaps-innovation.md` |
-| 状态 | 深析短文（分析意见）；**不改业务代码**；不修改冻结协议 |
+| 状态 | **已拍板口径**（分析意见成文）；不改业务代码；不修改冻结协议 |
 | 日期 | 2026-11-03（UTC+8） |
 | 效力 | 冲突以 `PHASE1-ARENA-PROTOCOL-v0.1.md` 为准；新颖点口径对齐 `docs/phase1-novelty-risks.md` / `docs/phase1-bf16-compute-strategy.md` |
-| 范围 | 仅本仓 `/workspace/MyOS`（GitHub `Ultimate-XDU/An-operating-system-for-AI-models-and-tensor-inference`） |
-| 触发 | 月星定调「基于别人仓找缺点与我们创新点」；仓寻 Top3；OSdeveloper 急求短文 |
+| 范围 | 仅本仓（GitHub `Ultimate-XDU/An-operating-system-for-AI-models-and-tensor-inference`） |
+| 触发 | 月星定调「基于别人仓找缺点与我们创新点」；仓寻 Top3；月星拍板主底座继续 MyOS |
 
-**阅读约定**：【已知事实】可在 URL / 仓内文件核对；【推测/建议】不得当协议条款，也不得夸大为已实证算子优势。
+**阅读约定**：【已知事实】可在 URL / 仓内文件核对；【推测/建议】不得当协议条款，也不得夸大为已实证算子优势。标 **【已拍板】** 的结论经月星确认，后续工程默认服从。
 
-**仓寻笔记**：本机 `/workspace` 下未找到独立「仓寻」成文笔记（`find` 无 `*仓*`/`*candidate*` 命中）；下文直接核对三仓公开 README / `Cargo.toml` / 源码与本仓已采纳口径。
+**材料来源**：三仓公开 README / `Cargo.toml` / 源码；本仓已采纳 novelty / BF16 策略文。仓寻口头 Top3 作候选名单，无独立成文笔记纳入本文件。
 
 ---
 
-## 0. 执行摘要（给 OSdeveloper）
+## 0. 执行摘要
 
 | 段 | 压缩结论 |
 |----|----------|
 | **A 硬短板** | **ember**：`std`+`rayon`+整表 BF16→f32，无协议 exact / 无 unikernel 分层。**candle**：框架级依赖闭包，非 no_std，不可裁进 Unikernel。**vitni-tensor**：no_std/bit-identical 强，但 **GGUF 主路径**、无 SafeTensors BF16 主赛道与本仓协议指纹契约。 |
-| **B 若站 ember** | 可声明切口应钉在：①协议竞技场先行；②no_std core × host 分层；③BF16 字节视图 + 算子内 f32 累加 + `acc_path` 指纹；④对 llama.cpp 的 exact-only 门闩（非 perplexity）；⑤双赛道分表（ST 主 / Q4 副后置）。勿宣称「手写算子本身更新」。 |
-| **C 建议** | **不宜把 ember 整仓 fork 成主底座替换 MyOS。** 主底座继续 **MyOS**；ember 作 Qwen2.5 ST 前向/算子对照矿；candle 作金标准行为对照；vitni 作确定性/归约纪律参考（慎整仓 fork：产品叙事与商标约束不同）。 |
+| **B 可声明切口** | 相对 ember（对照矿）可辩护的差分钉在：①协议竞技场先行；②no_std core × host 分层；③BF16 字节视图 + 算子内 f32 累加 + `acc_path` 指纹；④对 llama.cpp 的 exact-only 门闩；⑤双赛道分表（ST 主 / Q4 副后置）。勿宣称「手写算子本身更新」。 |
+| **C 主底座决议** | **【已拍板】主底座继续 MyOS，不整仓 fork ember。** ember=算子/前向对照矿；candle=行为金标准；vitni=确定性/归约纪律参考（慎整仓）。 |
 
 ---
 
@@ -82,15 +82,15 @@
 
 ---
 
-## 3. B · 若 fork ember：可声明的 3–5 个创新切口
+## 3. B · 相对 ember 可声明的创新切口（非整仓 fork）
 
-前提：【推测/建议】切口必须相对 ember **可证伪差分**，并对齐已采纳 novelty（协议先行 / no_std 分层 / 双赛道 exact），**禁止**把「手写 RMSNorm/RoPE/GQA/SwiGLU」当创新（ember 已有且 RoPE/SwiGLU 已对齐）。
+前提：切口必须相对 ember **可证伪差分**，并对齐已采纳 novelty（协议先行 / no_std 分层 / 双赛道 exact）。**【已拍板】** 主底座是 MyOS，下列切口是「站在 MyOS 上相对对照矿可讲什么」，**不是**「fork ember 后再改什么」。**禁止**把「手写 RMSNorm/RoPE/GQA/SwiGLU」当创新（ember 已有且 RoPE/SwiGLU 已对齐）。
 
 | # | 切口 | 相对 ember 的可核对差分 | 对齐本仓口径 |
 |---|------|-------------------------|--------------|
 | 1 | **对打协议先于算子完成** | ember：perplexity / NumPy oracle / CI bench；**无**冻结场景 S1–S6、指纹、±5%、CORRECT 一票否决 | `PHASE1-ARENA-PROTOCOL-v0.1.md`；novelty「协议先行」 |
 | 2 | **no_std core × host runtime 分层** | ember：单体 `std` bin + rayon + tokenizers | MyOS crates：`weight_loader`/`tensor_core`/`model_core` no_std 姿态；runtime host |
-| 3 | **BF16 字节视图 + 算子内 f32 累加 + `acc_path` 指纹** | ember：加载期整表 `bf16→f32` | `phase1-bf16-compute-strategy.md`；README `gemv_bf16` / `acc_path=bf16_w_fp32_acc` |
+| 3 | **BF16 字节视图 + 算子内 f32 累加 + `acc_path` 指纹** | ember：加载期整表 `bf16→f32` | `phase1-bf16-compute-strategy.md`；`acc_path=bf16_w_fp32_acc` |
 | 4 | **exact-only vs llama.cpp（主基线）** | ember：自研 oracle / 质量表；未钉 llama.cpp CPU 同指纹对打 | 协议 F2/A7/§4.1 |
 | 5 | **双赛道分表：ST-BF16 主胜负 / GGUF-Q4_K_M 副表后置** | ember：自定义 INT8/INT4 与 f32 混在同一产品叙事 | 协议 A1/A2；novelty「双赛道 exact」 |
 
@@ -98,31 +98,31 @@
 
 ---
 
-## 4. C · 明确建议：站不站 ember？
+## 4. C · 主底座决议
 
 ### 4.1 结论（钉死）
 
-**【推测/建议】「以 ember 为 Git 主底座整仓 fork 替换 MyOS」——不成立（作为主策略）。**
+**【已拍板】主底座继续 MyOS；不以 ember 为 Git 主底座整仓 fork 替换。**
 
-理由（事实驱动）：
+支撑理由（事实驱动，拍板前分析仍成立）：
 
 1. ember 的 **整表转 f32** 与已采纳 BF16 主路 **相反**；fork 后若立刻改回视图升精，等于重写加载与热路径，**吃不到「现成底座」红利**。
 2. ember 的 **rayon + tokenizers/onig + std 单体** 与 unikernel / no_std 分层目标冲突；剥依赖成本接近自研分层。
-3. MyOS **已有**：冻结协议、布局钉、SafeTensors mmap、BF16 gemv/embed/rmsnorm/RoPE(NeoX)/GQA/SwiGLU 路径与 novelty 文档——继续 MyOS 的沉没成本与目标一致性更高。
-4. ember 星少、推送窗口短（API：`stargazers_count=1`，`pushed_at`≈创建当日），**工程成熟度不足以压过协议/分层已投入**。
+3. MyOS **已有**：冻结协议、布局钉、SafeTensors mmap、BF16 路径与 novelty 文档——继续 MyOS 的目标一致性更高。
+4. ember 公开活跃度与工程成熟度不足以压过协议/分层已投入（API：`stargazers_count` 低、推送窗口短——以查阅当时为准）。
 
-### 4.2 若否，替谁？
+### 4.2 三仓角色（拍板后默认）
 
-| 角色 | 建议 | 用法 |
+| 角色 | 决议 | 用法 |
 |------|------|------|
-| **主底座** | **继续 MyOS**（本仓） | 唯一合入面；OSdeveloper 写 GitHub |
+| **主底座** | **MyOS（本仓）** | 唯一合入面；GitHub 写操作仅 OSdeveloper |
 | **算子/前向对照矿** | **ember** | 对照 Qwen2 ST 前向结构、bias 规则、RoPE half、SwiGLU；**移植思想，不整仓替换** |
 | **金标准行为对照** | **candle** `qwen` / `quantized-qwen2-*` | 核对 HF 布局与生成行为；**禁止**引入 candle 为 core 依赖 |
 | **确定性/归约纪律参考** | **vitni-tensor**（文档级） | 借鉴「钉死 reduction / regime」写法；**不**把 receipt 产品叙事或 GGUF-first 整仓迁入；注意商标 |
 
 ### 4.3 可接受的窄例外（仍非「站 ember」）
 
-**【推测/建议】** 若仅为加速「第一次连贯 decode」做 **抛掷型 spike 分支**：可临时跑 ember 可执行文件做行为对照；**成果只允许以算子差分/测试向量形式合入 MyOS**，不改变默认分支血统为 ember fork。
+**【推测/建议】** 若仅为加速「第一次连贯 decode」做 **抛掷型 spike**：可临时跑 ember 可执行文件做行为对照；**成果只允许以算子差分/测试向量形式合入 MyOS**，不改变默认分支血统为 ember fork。
 
 ---
 
@@ -130,9 +130,9 @@
 
 | 源 | URL / 路径 |
 |----|------------|
-| ember README / Cargo / ops / model / tensor | `https://github.com/codewithfourtix/ember`；`raw.../README.md`；`Cargo.toml`；`src/ops.rs`；`src/model.rs`；`src/tensor.rs` |
-| candle README / candle-core Cargo / qwen example | `https://github.com/huggingface/candle`；`candle-core/Cargo.toml`；`candle-examples/examples/qwen/main.rs` |
-| vitni README / Cargo / regimes | `https://github.com/vitnify/vitni-tensor`；`Cargo.toml`；`docs/regimes.md`；`src/lib.rs`（`#![no_std]`） |
+| ember README / Cargo / ops / model / tensor | https://github.com/codewithfourtix/ember |
+| candle README / candle-core / qwen example | https://github.com/huggingface/candle |
+| vitni README / Cargo / regimes | https://github.com/vitnify/vitni-tensor |
 | 本仓协议与口径 | `PHASE1-ARENA-PROTOCOL-v0.1.md`；`docs/phase1-novelty-risks.md`；`docs/phase1-bf16-compute-strategy.md`；`README.md` |
 
 ---
@@ -141,4 +141,5 @@
 
 | 日期（UTC+8） | 说明 |
 |---------------|------|
-| 2026-11-03 | 初稿：Top3 硬短板 + fork ember 切口 + 主底座建议（深析） |
+| 2026-11-03 | 初稿：Top3 硬短板 + 相对 ember 切口 + 主底座建议（深析） |
+| 2026-11-03 | 合入整理：月星拍板「主底座继续 MyOS / 不整仓 fork ember」写入正文；章节用语从「若 fork」改为「相对对照矿可声明切口」（深析） |
