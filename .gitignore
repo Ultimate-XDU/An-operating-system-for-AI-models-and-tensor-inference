@@ -4,3 +4,4 @@
 *.gguf
 *.safetensors
 /models
+runs/
