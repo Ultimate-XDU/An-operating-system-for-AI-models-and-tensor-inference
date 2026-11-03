@@ -1,12 +1,20 @@
 //! ModelCore — unified MinimalistModel trait (Phase 1).
 //!
 //! `QwenStub` is a CPU toy: one embedding row plus one `lm_head` GEMV. It is not a Qwen block.
+//! Its cursor is [`StubCursor`].
 //! Real 1.5B Instruct names and shapes live in [`qwen25_layout`].
-//! [`qwen25_bf16`] borrows those tensors as BF16 bytes. The stub does not call either.
+//! [`qwen25_bf16`] borrows those tensors as BF16 bytes.
+//! [`KvCache`] stores per-layer K and V. [`attention_layer`] runs one attention
+//! layer into that cache. The stub calls neither. A full block forward is later.
 #![cfg_attr(not(test), no_std)]
 
+pub mod attn_wire;
+pub mod kv_cache;
 pub mod qwen25_bf16;
 pub mod qwen25_layout;
+
+pub use attn_wire::{attention_layer, AttnError, AttnShape, AttnWorkspace};
+pub use kv_cache::{KvCache, KvError, KvShape};
 
 extern crate alloc;
 
@@ -21,9 +29,11 @@ pub trait MinimalistModel {
     fn forward_token(&mut self, token: u32, pos: usize, kv: &mut Self::KvCache) -> &[f32];
 }
 
-/// Counts tokens this stub has forwarded. There is no real KV tensor in P0.
+/// Counts tokens [`QwenStub`] has forwarded.
+///
+/// The cycle smoke stores a length and a position here. K and V live on [`KvCache`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KvCache {
+pub struct StubCursor {
     pub len: usize,
     pub last_pos: usize,
 }
@@ -120,7 +130,7 @@ impl QwenStub {
 }
 
 impl MinimalistModel for QwenStub {
-    type KvCache = KvCache;
+    type KvCache = StubCursor;
 
     fn forward_token(&mut self, token: u32, pos: usize, kv: &mut Self::KvCache) -> &[f32] {
         let token = token as usize;
@@ -168,13 +178,13 @@ mod tests {
         assert_eq!(model.vocab(), 4);
         assert_eq!(model.dim(), 4);
 
-        let mut kv = KvCache::default();
+        let mut kv = StubCursor::default();
         let logits = model.forward_token(0, 0, &mut kv);
         assert_eq!(logits, &[0.0, 1.0, 0.0, 0.0]);
         assert_eq!(greedy_token(logits), 1);
         assert_eq!(
             kv,
-            KvCache {
+            StubCursor {
                 len: 1,
                 last_pos: 0
             }

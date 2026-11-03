@@ -1,9 +1,11 @@
 //! TensorCore — Phase 1 CPU ops.
 //!
 //! [`gemv_f32`] is the f32 fixture path used by the cycle smoke.
-//! [`gemv_bf16`], [`embed_gather_bf16`], and [`rmsnorm_bf16_weight`] are the
-//! main-track numeric path: little-endian BF16 weight bytes, decoded to f32
-//! inside the op. Activations stay f32. The whole matrix is not loaded as f32.
+//! [`gemv_bf16`], [`add_bf16_bias`], [`embed_gather_bf16`], and
+//! [`rmsnorm_bf16_weight`] are the main-track numeric path: little-endian BF16
+//! weight bytes, decoded to f32 inside the op. Activations stay f32. The whole
+//! matrix is not loaded as f32. [`add_bf16_bias`] is the Q/K/V bias add after
+//! a projection (`y[i] +=` the promoted bias); `o_proj` and the MLP do not use it.
 //! [`rmsnorm_f32`] is the f32-gamma reference for the same reduction.
 //! [`rope_f32`] and [`rope_f32_inplace`] rotate Q or K heads in f32. There is
 //! no weight byte view: the frequency table is `powf`, then libm `cosf`/`sinf`.
@@ -37,8 +39,8 @@ mod gqa;
 mod rope;
 mod swiglu;
 pub use bf16::{
-    bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32, Bf16OpError,
-    ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
+    add_bf16_bias, bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32,
+    Bf16OpError, ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
 };
 pub use gqa::{
     attn_scale_f32, gqa_attn_f32, GqaError, GqaMask, GqaShape, GQA_Q_PER_KV_QWEN25_1_5B,

@@ -131,4 +131,4 @@ SafeTensors 的二维布局是 `[out, in]`（PyTorch linear weight）。加载�
 
 ## Code pin
 
-`crates/model_core/src/qwen25_layout.rs` 导出层数、hidden、intermediate、head 计数，以及 embed、final norm、每一层 `model.layers.{i}.*` 的键名和形状。没有 `lm_head` 键。`crates/model_core/src/qwen25_bf16.rs` 从 `WeightMap` / `SafeTensorsWeights` 借这些张量的 little-endian BF16 字节，并按上面的形状核对；不把字节解成 `Vec<f32>`。`QwenStub::forward_token` 与 `cycle_fixture` 不读取它们。烟雾测试仍是 `cargo test --workspace` 里的 cycle GEMV，不打开本权重文件。
+`crates/model_core/src/qwen25_layout.rs` 导出层数、hidden、intermediate、head 计数，以及 embed、final norm、每一层 `model.layers.{i}.*` 的键名和形状。没有 `lm_head` 键。`crates/model_core/src/qwen25_bf16.rs` 从 `WeightMap` / `SafeTensorsWeights` 借这些张量的 little-endian BF16 字节，并按上面的形状核对；不把字节解成 `Vec<f32>`。`QwenStub::forward_token` 与 `cycle_fixture` 不读取它们。刀② 的 `attention_layer` 用同一套键名借 q/k/v/o 与 q/k/v bias；单测把 `AttnShape` 缩小，不下载权重。全层 forward 还没接。烟雾测试仍是 `cargo test --workspace` 里的 cycle GEMV，不打开本权重文件。

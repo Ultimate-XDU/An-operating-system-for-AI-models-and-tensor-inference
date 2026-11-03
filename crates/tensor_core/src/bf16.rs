@@ -104,6 +104,30 @@ pub fn gemv_bf16(
     Ok(())
 }
 
+/// `y[i] += bf16_to_f32(bias[i])`.
+///
+/// `bias` is little-endian BF16, `2 * y.len()` bytes. Each element is promoted
+/// inside this loop and then added in f32. The vector is not copied into a
+/// `Vec<f32>` first, and the add is not fused into a GEMV dot: Qwen2.5 adds
+/// the Q/K/V bias after `gemv_bf16` has finished the row. `o_proj` and the MLP
+/// have no bias; callers simply do not call this for those projections.
+///
+/// A matching empty pair (`y` and `bias` both empty) is a no-op. Any other
+/// length, including an odd byte length, is [`Bf16OpError::Shape`] and leaves
+/// `y` unchanged.
+pub fn add_bf16_bias(y: &mut [f32], bias: &[u8]) -> Result<(), Bf16OpError> {
+    let nbytes = y.len().checked_mul(2).ok_or(Bf16OpError::Shape)?;
+    if bias.len() != nbytes {
+        return Err(Bf16OpError::Shape);
+    }
+    for i in 0..y.len() {
+        let mut le = [0u8; 2];
+        le.copy_from_slice(&bias[i * 2..i * 2 + 2]);
+        y[i] += bf16_le_to_f32(le);
+    }
+    Ok(())
+}
+
 /// Copy embedding row `token_id` into `out` as f32.
 ///
 /// `table` is a row-major little-endian BF16 matrix. `shape` is `[vocab, hidden]`.
@@ -265,6 +289,32 @@ mod tests {
         assert_eq!(bf16_le_to_f32([0x00, 0xC0]), -2.0);
         assert_eq!(bf16_le_to_f32([0x3F, 0x80]), f32::from_bits(0x803F_0000));
         assert_ne!(bf16_le_to_f32([0x3F, 0x80]), 1.0);
+    }
+
+    #[test]
+    fn add_bf16_bias_adds_after_promotion() {
+        // 10 and 20 are already f32. 0.5 and 1.0 are exact BF16. The add is
+        // one f32 `+=` per lane, after the whole bias element is promoted.
+        let mut y = [10.0f32, 20.0];
+        add_bf16_bias(&mut y, &pack(&[0.5, 1.0])).unwrap();
+        assert_eq!(y, [10.5, 21.0]);
+
+        let mut kept = [7.0f32, 8.0, 9.0];
+        let before = kept;
+        assert_eq!(
+            add_bf16_bias(&mut kept, &pack(&[0.5, 1.0])),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(kept, before);
+        // Odd byte length: not a BF16 vector. `y` stays put.
+        assert_eq!(
+            add_bf16_bias(&mut kept[..1], &[0x00]),
+            Err(Bf16OpError::Shape)
+        );
+        assert_eq!(kept, before);
+
+        let mut empty = [];
+        assert_eq!(add_bf16_bias(&mut empty, &[]), Ok(()));
     }
 
     #[test]
