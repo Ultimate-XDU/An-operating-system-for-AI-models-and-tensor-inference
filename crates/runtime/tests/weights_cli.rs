@@ -132,11 +132,59 @@ fn bad_weights_do_not_print_smoke() {
 }
 
 #[test]
+fn block_fixture_flag_is_not_the_cycle_smoke() {
+    let (ok, code, out, err) = stdout(myos().arg("--block-fixture"));
+    assert!(ok, "stderr={err}");
+    assert_eq!(code, 0);
+    assert_eq!(err, "");
+    assert_eq!(out, "MyOS Phase1 block fixture (prompt=0): [1, 1, 1, 1]\n");
+    assert!(!out.contains("[1, 2, 3, 0]"));
+    assert!(!out.contains("smoke decode"));
+}
+
+#[test]
+fn weights_then_block_fixture_skips_cycle_smoke() {
+    let tmp = TempFile::write("flag-block", &tiny_safetensors());
+    let (ok, _, out, err) =
+        stdout(myos().args(["--weights", tmp.path().to_str().unwrap(), "--block-fixture"]));
+    assert!(ok, "stderr={err} stdout={out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert!(lines[0].ends_with(": 2 tensors"), "{out}");
+    assert_eq!(lines[1], "bias");
+    assert_eq!(lines[2], "w");
+    assert_eq!(
+        lines[3],
+        "MyOS Phase1 block fixture (prompt=0): [1, 1, 1, 1]"
+    );
+    assert!(!out.contains("smoke decode"));
+    assert!(!out.contains("[1, 2, 3, 0]"));
+}
+
+#[test]
+fn bad_weights_skip_the_block_fixture() {
+    let missing = std::env::temp_dir().join(format!(
+        "myos-runtime-block-missing-{}-{}.safetensors",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (ok, code, out, err) =
+        stdout(myos().args(["--block-fixture", "--weights", missing.to_str().unwrap()]));
+    assert!(!ok);
+    assert_eq!(code, 1);
+    assert!(err.contains("MyOS weights"), "{err}");
+    assert!(!out.contains("block fixture"), "{out}");
+    assert!(!out.contains("smoke decode"), "{out}");
+}
+
+#[test]
 fn unknown_argument_is_usage() {
     let (ok, code, out, err) = stdout(myos().arg("--bogus"));
     assert!(!ok);
     assert_eq!(code, 2);
     assert!(err.contains("unknown argument"));
-    assert!(err.contains("usage: myos [--weights PATH]"));
+    assert!(err.contains("usage: myos [--weights PATH] [--block-fixture]"));
     assert_eq!(out, "");
 }

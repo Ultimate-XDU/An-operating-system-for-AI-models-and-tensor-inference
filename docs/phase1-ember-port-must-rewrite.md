@@ -34,6 +34,14 @@ ember 的 `load_f32` 在加载期把 BF16/F16/F32 整表收成 `Vec<f32>`。MyOS
 
 - `model_core::KvCache`：每层 K/V。Qwen2.5-1.5B 为 28 层、2 个 KV 头、head dim 128。形状在 `KvShape` 上，单测可缩小。同一 token 的每一层都写在当前 cursor，调用方在该 token 结束后 `advance` 一次。`attention_layer` 自己不 `advance`。控制流参考 ember `src/attention.rs` `KvCache` 与 `src/model.rs` `Model::new_cache`（MIT, Copyright (c) 2026 Ali Zulfiqar）。槽布局是 `[kv_head, pos, head_dim]`，打成 `[kv_head, seq, head_dim]` 后交给已有的 `gqa_attn_f32`（`e / sum`）。
 - `model_core::attention_layer`：经 `qwen25_bf16` 借 q/k/v/o 权重和 q/k/v bias（BF16 字节，形状可缩小）。`gemv_bf16`，再 `tensor_core::add_bf16_bias`（升精在算子内），Q/K 走 `rope_f32_inplace`（NeoX），V 不旋转，写入 cache，`gqa_attn_f32`，`o_proj` 无 bias，残差相加。不做 RMSNorm，不做 SwiGLU，不循环 28 层。
-- 未做，留给刀③：整块 forward、prefill/decode 循环。
+- 整块 forward、tied `lm_head`、prefill/decode 已由刀③接上。
+
+## 刀③ 状态
+
+刀③已落地，仍服从上面三条。
+
+- `model_core::forward_token`：每一层 `input_layernorm` → `attention_layer`（`o_proj` 残差在该函数里加）→ `post_attention_layernorm` → `swiglu_bf16` → 残差。全部层之后是 `model.norm.weight`，再用 `gemv_bf16` 乘 `model.embed_tokens.weight`。没有 `lm_head` 键。升精只在已有算子内。控制流参考 ember `Model::forward`（MIT, Copyright (c) 2026 Ali Zulfiqar，`src/model.rs` 的 block 循环、final norm、tied lm_head）和 `src/main.rs` 的 prefill / greedy，但只吃 token id。不抄 `load_f32`、rayon、tokenizers、`*(1/sum)` softmax、interleaved RoPE。
+- `attention_layer` 仍不 `advance`。`forward_token` 在该 token 每一层都 `store` 之后调用一次 `KvCache::advance`。`prefill` / `greedy_decode` 不再次 advance。
+- `myos_runtime` 默认烟雾仍是 `[1, 2, 3, 0]`。`--block-fixture` 另走一条进程内微型 BF16 夹具上的 greedy，不下载 1.5B。
 
 `QwenStub` 仍用 `StubCursor` 计数。烟雾行仍是 `[1, 2, 3, 0]`。
