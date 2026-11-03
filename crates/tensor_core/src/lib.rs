@@ -15,6 +15,12 @@
 //! `1/sqrt(head_dim)`, serial softmax, then the value mix. Qwen2.5-1.5B
 //! passes 12 query heads and 2 KV heads ([`NUM_ATTENTION_HEADS_QWEN25_1_5B`],
 //! [`NUM_KV_HEADS_QWEN25_1_5B`]). See the `gqa` module.
+//! [`swiglu_bf16`] is the Qwen2 MLP: [`gemv_bf16`] for `mlp.gate_proj`,
+//! `mlp.up_proj`, and `mlp.down_proj`, then [`silu_f32`] on the gate
+//! (`z / (1 + expf(-z))`) times up. No bias on any of the three. Activations
+//! stay f32. [`swiglu_f32`] is the same graph on f32 weights. Qwen2.5-1.5B
+//! passes [`HIDDEN_SIZE_QWEN25_1_5B`] (1536) and
+//! [`INTERMEDIATE_SIZE_QWEN25_1_5B`] (8960). See the `swiglu` module.
 //!
 //! Fingerprint intent (the run hash is later): `quant_or_dtype=bf16`
 //! ([`QUANT_OR_DTYPE`]), `acc_path=bf16_w_fp32_acc` ([`ACC_PATH`]).
@@ -22,11 +28,14 @@
 //! left to right, f32. Qwen2.5 passes [`RMS_NORM_EPS_QWEN25`] (`1e-6`).
 //! GQA stays on f32 activations (no second dtype). Its exact-sensitive steps
 //! are the serial dot, the f32 scale, and the serial max / `expf` / sum / divide.
+//! SwiGLU stays on that path too: serial GEMV, `expf` inside SiLU, the
+//! division form of SiLU, and a left-to-right multiply. No second dtype.
 #![cfg_attr(not(test), no_std)]
 
 mod bf16;
 mod gqa;
 mod rope;
+mod swiglu;
 pub use bf16::{
     bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32, Bf16OpError,
     ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
@@ -37,6 +46,10 @@ pub use gqa::{
 };
 pub use rope::{
     rope_f32, rope_f32_inplace, rope_inv_freqs, RopeError, HEAD_DIM_QWEN25_1_5B, ROPE_THETA_QWEN25,
+};
+pub use swiglu::{
+    silu_f32, swiglu_bf16, swiglu_f32, swiglu_mul_f32, SwigluError, SwigluShape,
+    HIDDEN_SIZE_QWEN25_1_5B, INTERMEDIATE_SIZE_QWEN25_1_5B,
 };
 
 /// y[i] = sum_j W[i,j] * x[j]
