@@ -39,6 +39,10 @@ MYOS_WEIGHTS=path/to/file.safetensors cargo run -p myos_runtime
 
 The runtime smoke above is unchanged: it still loads `MmapWeights` via `cycle_fixture`, not a SafeTensors file.
 
+## Qwen2.5 weight keys
+
+`model_core::qwen25_layout` names every Qwen2.5-1.5B-Instruct tensor (`model.embed_tokens.weight`, `model.layers.{i}.*` for `i = 0..27`, and `model.norm.weight`) and the shapes from `docs/qwen25-1.5b-instruct-layout.md`. There is no `lm_head` key (`tie_word_embeddings`). `model_core::qwen25_bf16` borrows those payloads as little-endian BF16 byte views from any `WeightMap`, including `SafeTensorsWeights`, and rejects a missing name, a non-BF16 dtype, or a shape that is not the layout shape. It does not decode the bytes to `f32`. `QwenStub` still uses the f32 cycle fixture.
+
 ## BF16 numeric path
 
 Phase1 main-track weights stay BF16 byte views. `tensor_core::gemv_bf16` is a row-major little-endian BF16 matrix times an f32 vector, accumulated in f32. `tensor_core::embed_gather_bf16` copies one `[vocab, hidden]` row into an f32 vector. Both decode BF16 (the top 16 bits of f32) inside the op. They do not call `load_f32_tensor`, and `load_f32_tensor` stays F32-only.

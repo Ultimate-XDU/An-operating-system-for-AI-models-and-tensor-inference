@@ -7,7 +7,7 @@
 | 来源 | 仓寻核对的 Hub 元数据；本文件按同一 revision 复核 |
 | 日期 | 2026-11-02 |
 | 效力 | 布局事实。与对打协议冲突时以 `PHASE1-ARENA-PROTOCOL-v0.1.md` 为准 |
-| 代码 | `model_core::qwen25_layout` 只放常量。`QwenStub` / `cycle_fixture` 仍用玩具键，不读这些常量 |
+| 代码 | `model_core::qwen25_layout` 放常量与键名；`model_core::qwen25_bf16` 借 BF16 字节。`QwenStub` / `cycle_fixture` 仍用玩具键，不读这些常量 |
 
 复核方式（未下载 3GB 权重）：Hub `tree/main` 给出文件大小与 LFS oid；对 `model.safetensors` 只做 HTTP Range，读 8 字节头长加 38,528 字节 JSON header。模型仓 revision `989aa7980e4cf806f80c7fef2b1adb7bc71aa306`。`config.json` 与模型卡 README 同一次读取。
 
@@ -131,4 +131,4 @@ SafeTensors 的二维布局是 `[out, in]`（PyTorch linear weight）。加载�
 
 ## Code pin
 
-`crates/model_core/src/qwen25_layout.rs` 只导出层数、hidden、vocab，以及 embed / final-norm 两个键名。`QwenStub::forward_token` 与 `cycle_fixture` 不读取它们。烟雾测试仍是 `cargo test --workspace` 里的 cycle GEMV，不打开本权重文件。
+`crates/model_core/src/qwen25_layout.rs` 导出层数、hidden、intermediate、head 计数，以及 embed、final norm、每一层 `model.layers.{i}.*` 的键名和形状。没有 `lm_head` 键。`crates/model_core/src/qwen25_bf16.rs` 从 `WeightMap` / `SafeTensorsWeights` 借这些张量的 little-endian BF16 字节，并按上面的形状核对；不把字节解成 `Vec<f32>`。`QwenStub::forward_token` 与 `cycle_fixture` 不读取它们。烟雾测试仍是 `cargo test --workspace` 里的 cycle GEMV，不打开本权重文件。
