@@ -252,6 +252,12 @@ fn block_fixture_flag_is_not_the_cycle_smoke() {
     assert!(json.contains("\"n_gen\": 4"), "{json}");
     assert!(json.contains("\"n_ctx\": 5"), "{json}");
     assert!(json.contains("\"commit\": null"), "{json}");
+    assert!(json.contains("\"n_prompt\": 1"), "{json}");
+    assert!(!json.contains("E2-capable multi-token path"), "{json}");
+    assert!(!dir
+        .path()
+        .join("runs/s1-block-fixture/token_ids.txt")
+        .exists());
 }
 
 #[test]
@@ -340,7 +346,128 @@ fn unknown_argument_is_usage() {
     assert_eq!(code, 2);
     assert!(err.contains("unknown argument"));
     assert!(err.contains(
-        "usage: myos [--weights PATH] [--block-fixture] [--steps N] [--fingerprint-dir DIR]"
+        "usage: myos [--weights PATH] [--block-fixture] [--steps N] [--fingerprint-dir DIR] [--prompt-ids PATH] [--ref-ids PATH]"
     ));
     assert_eq!(out, "");
+}
+
+#[test]
+fn prompt_ids_without_weights_is_usage() {
+    let dir = Scratch::new("prompt-usage");
+    let (ok, code, out, err) = stdout(myos(dir.path()).args(["--prompt-ids", "ids.txt"]));
+    assert!(!ok);
+    assert_eq!(code, 2);
+    assert!(err.contains("--prompt-ids needs --weights"), "{err}");
+    assert_eq!(out, "");
+
+    let (ok, code, out, err) = stdout(myos(dir.path()).args([
+        "--block-fixture",
+        "--weights",
+        "a.safetensors",
+        "--prompt-ids",
+        "ids.txt",
+    ]));
+    assert!(!ok);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("--prompt-ids cannot be combined with --block-fixture"),
+        "{err}"
+    );
+    assert_eq!(out, "");
+    assert!(!dir.path().join("runs").exists());
+}
+
+#[test]
+fn empty_prompt_ids_errors_before_decode() {
+    let dir = Scratch::new("empty-prompt");
+    let tmp = TempFile::write("empty-prompt", &tiny_safetensors());
+    let ids = dir.path().join("empty.txt");
+    std::fs::write(&ids, " \n").unwrap();
+    let (ok, code, out, err) = stdout(myos(dir.path()).args([
+        "--weights",
+        tmp.path().to_str().unwrap(),
+        "--prompt-ids",
+        ids.to_str().unwrap(),
+    ]));
+    assert!(!ok);
+    assert_eq!(code, 1);
+    assert!(err.contains("MyOS prompt-ids"), "{err}");
+    assert!(err.contains("empty"), "{err}");
+    assert!(!out.contains("smoke decode"), "{out}");
+    assert!(!out.contains("weights decode"), "{out}");
+    assert!(!dir.path().join("runs").exists());
+}
+
+#[test]
+fn prompt_ids_on_tiny_weights_still_rejects_the_1_5b_shape() {
+    let dir = Scratch::new("prompt-mini");
+    let tmp = TempFile::write("prompt-mini", &miniature_block_safetensors());
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "0 1 2\n").unwrap();
+    let (ok, code, out, err) = stdout(myos(dir.path()).args([
+        "--weights",
+        tmp.path().to_str().unwrap(),
+        "--prompt-ids",
+        ids.to_str().unwrap(),
+        "--steps",
+        "2",
+    ]));
+    assert!(!ok, "stdout={out}");
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("tensor shape does not match the layout"),
+        "{err}"
+    );
+    assert!(!out.contains("weights decode"), "{out}");
+    assert!(!out.contains("smoke decode"), "{out}");
+    assert!(!dir.path().join("runs").exists());
+}
+
+#[test]
+fn ref_ids_on_block_fixture_prints_correct_and_exits_zero() {
+    let dir = Scratch::new("ref");
+    let pass = dir.path().join("pass.txt");
+    std::fs::write(&pass, "1 1 1 1\n").unwrap();
+    let (ok, code, out, err) =
+        stdout(myos(dir.path()).args(["--block-fixture", "--ref-ids", pass.to_str().unwrap()]));
+    assert!(ok, "stderr={err} stdout={out}");
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "MyOS Phase1 block fixture (prompt=0): [1, 1, 1, 1]\nCORRECT: PASS\n"
+    );
+
+    let fail = dir.path().join("fail.txt");
+    std::fs::write(&fail, "1 2 1 1\n").unwrap();
+    let (ok, code, out, err) =
+        stdout(myos(dir.path()).args(["--block-fixture", "--ref-ids", fail.to_str().unwrap()]));
+    assert!(ok, "stderr={err} stdout={out}");
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("CORRECT: FAIL first_diff@1: got=1 ref=2"),
+        "{out}"
+    );
+
+    let short = dir.path().join("short.txt");
+    std::fs::write(&short, "1 1\n").unwrap();
+    let (ok, code, out, err) =
+        stdout(myos(dir.path()).args(["--block-fixture", "--ref-ids", short.to_str().unwrap()]));
+    assert!(ok, "stderr={err} stdout={out}");
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("CORRECT: FAIL length mismatch got=4 ref=2"),
+        "{out}"
+    );
+}
+
+#[test]
+fn missing_ref_ids_does_not_print_smoke() {
+    let dir = Scratch::new("missing-ref");
+    let missing = dir.path().join("no-such-ref.txt");
+    let (ok, code, out, err) =
+        stdout(myos(dir.path()).args(["--ref-ids", missing.to_str().unwrap()]));
+    assert!(!ok);
+    assert_eq!(code, 1);
+    assert!(err.contains("MyOS ref-ids"), "{err}");
+    assert!(!out.contains("smoke decode"), "{out}");
 }

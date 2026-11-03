@@ -38,17 +38,21 @@ pub fn default_run_dir(kind: RunKind) -> PathBuf {
 pub struct RunSpec {
     pub kind: RunKind,
     pub shape: BlockShape,
+    /// First prompt id. The default weights path passes 0.
     pub prompt_token: u32,
     pub n_prompt: u64,
     pub steps: usize,
     pub cmdline: String,
     pub commit: Option<String>,
+    /// Set when `--prompt-ids` supplied the prompt for this run.
+    pub e2_prompt_ids: bool,
 }
 
 /// Protocol §1.3, plus the BF16 accumulate path this tree already pinned.
 ///
-/// `model_sha256` and `seed` stay empty. `scenario_id` is the placeholder
-/// `S1`: `n_prompt` and `n_gen` are this process, not the protocol's 128/128.
+/// `model_sha256` and `seed` stay empty. `scenario_id` is `S1`. Without
+/// `--prompt-ids`, `n_prompt` is 1. With `--prompt-ids`, `n_prompt` is the
+/// file length and `n_gen` is `--steps` (protocol S1 is 128 and 128).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFingerprint {
     pub model_id: Option<String>,
@@ -84,6 +88,16 @@ scenario_id S1 is a placeholder; n_prompt, n_gen, and n_ctx are this process, no
 model_id is set only when layout is qwen25_1_5b. \
 threads is 1 and batch is 1 because this loop is one thread and one token at a time. \
 This file is not a llama.cpp exact comparison.";
+
+const NOTES_E2: &str = "\
+model_sha256 is null: this process does not hash the file and does not copy the layout doc LFS oid. \
+seed is null: greedy argmax has no RNG. \
+E2-capable multi-token path: --prompt-ids is prefilled in order, then greedy --steps tokens are decoded. \
+n_prompt is that file's length and n_gen is --steps (protocol S1 is n_prompt=128, n_gen=128). \
+n_ctx is n_prompt + n_gen, the KvCache max_seq for this process. \
+model_id is set only when layout is qwen25_1_5b. \
+threads is 1 and batch is 1 because this loop is one thread and one token at a time. \
+--ref-ids prints CORRECT. This fingerprint file is not itself a llama.cpp exact comparison.";
 
 impl RunFingerprint {
     pub fn from_spec(spec: RunSpec) -> Self {
@@ -122,7 +136,11 @@ impl RunFingerprint {
             intermediate_size: spec.shape.intermediate as u64,
             vocab_size: spec.shape.vocab as u64,
             prompt_token: u64::from(spec.prompt_token),
-            notes: NOTES.to_string(),
+            notes: if spec.e2_prompt_ids {
+                NOTES_E2.to_string()
+            } else {
+                NOTES.to_string()
+            },
         }
     }
 
@@ -179,6 +197,22 @@ pub fn write_run_fingerprint(dir: &Path, fp: &RunFingerprint) -> std::io::Result
     fs::create_dir_all(dir)?;
     let path = dir.join("run_fingerprint.json");
     fs::write(&path, fp.to_json())?;
+    Ok(path)
+}
+
+/// Write generated token ids as space-separated `u32`s, one trailing newline.
+pub fn write_token_ids(dir: &Path, ids: &[u32]) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("token_ids.txt");
+    let mut text = String::new();
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        text.push_str(&id.to_string());
+    }
+    text.push('\n');
+    fs::write(&path, text)?;
     Ok(path)
 }
 

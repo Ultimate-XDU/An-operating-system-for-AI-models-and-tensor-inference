@@ -10,11 +10,19 @@
 //! Payloads stay BF16 views in the map. This binary does not download weights
 //! and does not expand them to `Vec<f32>`.
 //!
+//! Without `--prompt-ids` the weights prompt is the single id `0`.
+//! `--prompt-ids PATH` prefills every whitespace-separated `u32` in that file
+//! (protocol S1 is 128 ids, then `--steps 128`). That run also writes
+//! `token_ids.txt` next to `run_fingerprint.json`. Optional `--ref-ids PATH`
+//! prints `CORRECT: PASS` or `CORRECT: FAIL ...` and exits 0 on a mismatch.
+//! `KvCache` / `BlockWorkspace` `max_seq` is `prompt.len() + steps`.
+//!
 //! Both of those decodes write `runs/<id>/run_fingerprint.json`.
 mod fingerprint;
 
 use fingerprint::{
-    default_run_dir, git_commit_at, write_run_fingerprint, RunFingerprint, RunKind, RunSpec,
+    default_run_dir, git_commit_at, write_run_fingerprint, write_token_ids, RunFingerprint,
+    RunKind, RunSpec,
 };
 use model_core::{
     block_fixture, cycle_fixture, fixture_shape, greedy_decode, greedy_token, prefill, BlockError,
@@ -23,6 +31,7 @@ use model_core::{
 };
 use std::env;
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use weight_loader::{SafeTensorsMmap, WeightError, WeightFileError, WeightMap};
@@ -30,9 +39,7 @@ use weight_loader::{SafeTensorsMmap, WeightError, WeightFileError, WeightMap};
 const SMOKE_VOCAB: usize = 4;
 const SMOKE_STEPS: usize = 4;
 const SMOKE_PROMPT: u32 = 0;
-/// This loop feeds one token id. Protocol S1's 128 is a different run.
-const N_PROMPT: u64 = 1;
-const USAGE: &str = "myos [--weights PATH] [--block-fixture] [--steps N] [--fingerprint-dir DIR]";
+const USAGE: &str = "myos [--weights PATH] [--block-fixture] [--steps N] [--fingerprint-dir DIR] [--prompt-ids PATH] [--ref-ids PATH]";
 
 fn main() -> ExitCode {
     let cli = match parse_cli(env::args().skip(1)) {
@@ -41,6 +48,14 @@ fn main() -> ExitCode {
             eprintln!("MyOS: {err}");
             eprintln!("usage: {USAGE}");
             return ExitCode::from(2);
+        }
+    };
+
+    let reference = match load_ref_ids(cli.ref_ids.as_deref()) {
+        Ok(ids) => ids,
+        Err(err) => {
+            eprintln!("MyOS ref-ids: {err}");
+            return ExitCode::from(1);
         }
     };
 
@@ -53,13 +68,18 @@ fn main() -> ExitCode {
         }
         return match block_fixture_decode(SMOKE_PROMPT, cli.steps) {
             Ok(tokens) => {
-                if let Err(err) =
-                    write_cli_fingerprint(RunKind::BlockFixture, fixture_shape(), &cli)
-                {
+                if let Err(err) = write_cli_fingerprint(
+                    RunKind::BlockFixture,
+                    fixture_shape(),
+                    &cli,
+                    &[SMOKE_PROMPT],
+                    None,
+                ) {
                     eprintln!("MyOS fingerprint: {err}");
                     return ExitCode::from(1);
                 }
                 println!("MyOS Phase1 block fixture (prompt={SMOKE_PROMPT}): {tokens:?}");
+                print_correct(&tokens, reference.as_deref());
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -70,18 +90,32 @@ fn main() -> ExitCode {
     }
 
     if let Some(path) = selected_weights_path(cli.weights.as_deref()) {
+        let prompt = match load_prompt(&cli) {
+            Ok(ids) => ids,
+            Err(err) => {
+                eprintln!("MyOS prompt-ids: {err}");
+                return ExitCode::from(1);
+            }
+        };
         let steps = cli.steps;
-        return match weights_decode(Path::new(&path), SMOKE_PROMPT, steps) {
+        let prompt_token = prompt[0];
+        return match weights_decode(Path::new(&path), &prompt, steps) {
             Ok(tokens) => {
-                if let Err(err) =
-                    write_cli_fingerprint(RunKind::Weights, BlockShape::qwen25_1_5b(), &cli)
-                {
+                let generated = cli.prompt_ids.as_ref().map(|_| tokens.as_slice());
+                if let Err(err) = write_cli_fingerprint(
+                    RunKind::Weights,
+                    BlockShape::qwen25_1_5b(),
+                    &cli,
+                    &prompt,
+                    generated,
+                ) {
                     eprintln!("MyOS fingerprint: {err}");
                     return ExitCode::from(1);
                 }
                 println!(
-                    "MyOS Phase1 weights decode (prompt={SMOKE_PROMPT}, steps={steps}): {tokens:?}"
+                    "MyOS Phase1 weights decode (prompt={prompt_token}, steps={steps}): {tokens:?}"
                 );
+                print_correct(&tokens, reference.as_deref());
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -94,6 +128,7 @@ fn main() -> ExitCode {
     match smoke_decode(SMOKE_PROMPT, cli.steps) {
         Ok(tokens) => {
             println!("MyOS Phase1 smoke decode (prompt={SMOKE_PROMPT}): {tokens:?}");
+            print_correct(&tokens, reference.as_deref());
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -108,10 +143,13 @@ struct Cli {
     block_fixture: bool,
     steps: usize,
     fingerprint_dir: Option<String>,
+    prompt_ids: Option<String>,
+    ref_ids: Option<String>,
 }
 
 /// `--weights PATH` or `--weights=PATH`, optional `--block-fixture`,
-/// `--steps N` (default [`SMOKE_STEPS`]), and optional `--fingerprint-dir`.
+/// `--steps N` (default [`SMOKE_STEPS`]), optional `--fingerprint-dir`,
+/// optional `--prompt-ids`, and optional `--ref-ids`.
 ///
 /// A missing value or any other argument is a usage error. `MYOS_WEIGHTS` is
 /// not read here so tests can supply argv without the process environment.
@@ -124,6 +162,8 @@ where
     let mut block_fixture = false;
     let mut steps = None;
     let mut fingerprint_dir = None;
+    let mut prompt_ids = None;
+    let mut ref_ids = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let arg = arg.as_ref();
@@ -153,16 +193,36 @@ where
             }
             continue;
         }
+        if let Some(value) = match_flag(arg, "--prompt-ids", &mut args)? {
+            if prompt_ids.replace(value).is_some() {
+                return Err("--prompt-ids was given more than once".to_string());
+            }
+            continue;
+        }
+        if let Some(value) = match_flag(arg, "--ref-ids", &mut args)? {
+            if ref_ids.replace(value).is_some() {
+                return Err("--ref-ids was given more than once".to_string());
+            }
+            continue;
+        }
         return Err(format!("unknown argument `{arg}`"));
     }
     if fingerprint_dir.is_some() && path.is_none() && !block_fixture {
         return Err("--fingerprint-dir needs --weights or --block-fixture".to_string());
+    }
+    if prompt_ids.is_some() && path.is_none() {
+        return Err("--prompt-ids needs --weights".to_string());
+    }
+    if prompt_ids.is_some() && block_fixture {
+        return Err("--prompt-ids cannot be combined with --block-fixture".to_string());
     }
     Ok(Cli {
         weights: path,
         block_fixture,
         steps: steps.unwrap_or(SMOKE_STEPS),
         fingerprint_dir,
+        prompt_ids,
+        ref_ids,
     })
 }
 
@@ -229,23 +289,36 @@ fn check_safetensors(path: &Path) -> Result<(), WeightFileError> {
 /// [`SafeTensorsWeights`](weight_loader::SafeTensorsWeights) borrows the map.
 /// [`decode_bf16`] reads those bytes through the existing block. Nothing here
 /// calls `load_f32_tensor`.
-fn weights_decode(path: &Path, prompt: u32, steps: usize) -> Result<Vec<u32>, WeightsError> {
+fn weights_decode(path: &Path, prompt: &[u32], steps: usize) -> Result<Vec<u32>, WeightsError> {
     let mapped = SafeTensorsMmap::open(path)?;
     let weights = mapped.parse()?;
     decode_bf16(&weights, BlockShape::qwen25_1_5b(), prompt, steps).map_err(WeightsError::Block)
 }
 
-/// Prefill one prompt id, then greedy-decode `steps` tokens.
+/// `KvCache` and [`BlockWorkspace`] capacity: one slot per prompt id and per
+/// generated token. A prompt of length 1 reproduces the old `steps + 1`.
+fn decode_max_seq(n_prompt: usize, steps: usize) -> Result<usize, BlockError> {
+    let max_seq = n_prompt.checked_add(steps).ok_or(BlockError::Shape)?;
+    if max_seq == 0 {
+        return Err(BlockError::Shape);
+    }
+    Ok(max_seq)
+}
+
+/// Prefill `prompt`, then greedy-decode `steps` tokens.
 ///
 /// The weights CLI passes [`BlockShape::qwen25_1_5b`]. The fixture CLI passes
 /// [`fixture_shape`]. Both go through [`prefill`] and [`greedy_decode`].
 fn decode_bf16(
     map: &impl WeightMap,
     shape: BlockShape,
-    prompt: u32,
+    prompt: &[u32],
     steps: usize,
 ) -> Result<Vec<u32>, BlockError> {
-    let max_seq = steps.checked_add(1).ok_or(BlockError::Shape)?;
+    if prompt.is_empty() {
+        return Err(BlockError::Shape);
+    }
+    let max_seq = decode_max_seq(prompt.len(), steps)?;
     let mut cache = KvCache::new(KvShape {
         num_layers: shape.num_layers,
         num_kv_heads: shape.attn.num_kv_heads,
@@ -254,7 +327,7 @@ fn decode_bf16(
     })
     .map_err(BlockError::Cache)?;
     let mut work = BlockWorkspace::new(shape, max_seq)?;
-    prefill(&[prompt], map, shape, &mut cache, &mut work)?;
+    prefill(prompt, map, shape, &mut cache, &mut work)?;
     let mut decoded = Vec::new();
     greedy_decode(steps, map, shape, &mut cache, &mut work, &mut decoded)?;
     Ok(decoded)
@@ -288,22 +361,93 @@ impl From<WeightError> for WeightsError {
     }
 }
 
-fn write_cli_fingerprint(kind: RunKind, shape: BlockShape, cli: &Cli) -> std::io::Result<PathBuf> {
+fn write_cli_fingerprint(
+    kind: RunKind,
+    shape: BlockShape,
+    cli: &Cli,
+    prompt: &[u32],
+    generated: Option<&[u32]>,
+) -> std::io::Result<PathBuf> {
     let dir = match &cli.fingerprint_dir {
         Some(dir) => PathBuf::from(dir),
         None => default_run_dir(kind),
     };
     let commit = env::current_dir().ok().as_deref().and_then(git_commit_at);
+    let prompt_token = prompt.first().copied().unwrap_or(SMOKE_PROMPT);
     let fp = RunFingerprint::from_spec(RunSpec {
         kind,
         shape,
-        prompt_token: SMOKE_PROMPT,
-        n_prompt: N_PROMPT,
+        prompt_token,
+        n_prompt: prompt.len() as u64,
         steps: cli.steps,
         cmdline: cmdline_from(env::args()),
         commit,
+        e2_prompt_ids: cli.prompt_ids.is_some(),
     });
-    write_run_fingerprint(&dir, &fp)
+    let path = write_run_fingerprint(&dir, &fp)?;
+    if let Some(ids) = generated {
+        write_token_ids(&dir, ids)?;
+    }
+    Ok(path)
+}
+
+/// `--prompt-ids` file, or the single smoke id when the flag is absent.
+fn load_prompt(cli: &Cli) -> Result<Vec<u32>, String> {
+    match &cli.prompt_ids {
+        Some(path) => read_token_ids(Path::new(path)),
+        None => Ok(vec![SMOKE_PROMPT]),
+    }
+}
+
+/// `None` when `--ref-ids` was not passed.
+fn load_ref_ids(path: Option<&str>) -> Result<Option<Vec<u32>>, String> {
+    match path {
+        Some(path) => read_token_ids(Path::new(path)).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Whitespace-separated `u32`s. An empty file is an error.
+fn read_token_ids(path: &Path) -> Result<Vec<u32>, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    parse_token_ids(&text).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+fn parse_token_ids(text: &str) -> Result<Vec<u32>, String> {
+    let mut ids = Vec::new();
+    for token in text.split_whitespace() {
+        let id = token
+            .parse::<u32>()
+            .map_err(|_| format!("`{token}` is not a u32"))?;
+        ids.push(id);
+    }
+    if ids.is_empty() {
+        return Err("file is empty".to_string());
+    }
+    Ok(ids)
+}
+
+/// Exact id compare. A mismatch is a recorded gate, not a process failure.
+fn correct_line(got: &[u32], reference: &[u32]) -> String {
+    if got.len() != reference.len() {
+        return format!(
+            "CORRECT: FAIL length mismatch got={} ref={}",
+            got.len(),
+            reference.len()
+        );
+    }
+    for (i, (got_id, ref_id)) in got.iter().zip(reference.iter()).enumerate() {
+        if got_id != ref_id {
+            return format!("CORRECT: FAIL first_diff@{i}: got={got_id} ref={ref_id}");
+        }
+    }
+    "CORRECT: PASS".to_string()
+}
+
+fn print_correct(got: &[u32], reference: Option<&[u32]>) {
+    if let Some(reference) = reference {
+        println!("{}", correct_line(got, reference));
+    }
 }
 
 fn cmdline_from<I, S>(args: I) -> String
@@ -324,7 +468,7 @@ where
 fn block_fixture_decode(prompt: u32, steps: usize) -> Result<Vec<u32>, BlockError> {
     let shape = fixture_shape();
     let weights = block_fixture()?;
-    decode_bf16(&weights, shape, prompt, steps)
+    decode_bf16(&weights, shape, &[prompt], steps)
 }
 
 /// Load the synthetic cycle, then greedy-decode `steps` tokens from `prompt`.
@@ -345,8 +489,9 @@ fn smoke_decode(prompt: u32, steps: usize) -> Result<Vec<u32>, ModelError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_fixture_decode, cmdline_from, decode_bf16, parse_cli, smoke_decode, weights_decode,
-        BlockShape, WeightsError, N_PROMPT, SMOKE_PROMPT, SMOKE_STEPS,
+        block_fixture_decode, cmdline_from, correct_line, decode_bf16, decode_max_seq, parse_cli,
+        parse_token_ids, read_token_ids, smoke_decode, weights_decode, write_cli_fingerprint,
+        BlockShape, Cli, WeightsError, SMOKE_PROMPT, SMOKE_STEPS,
     };
     use crate::fingerprint::{
         default_run_dir, git_commit_at, write_run_fingerprint, RunFingerprint, RunKind, RunSpec,
@@ -382,6 +527,8 @@ mod tests {
         assert!(!empty.block_fixture);
         assert_eq!(empty.steps, SMOKE_STEPS);
         assert_eq!(empty.fingerprint_dir, None);
+        assert_eq!(empty.prompt_ids, None);
+        assert_eq!(empty.ref_ids, None);
         assert_eq!(
             parse_cli(["--weights", "a.safetensors"]).unwrap().weights,
             Some("a.safetensors".to_string())
@@ -410,6 +557,38 @@ mod tests {
         assert!(parse_cli(["--fingerprint-dir", "out"]).is_err());
         assert!(parse_cli(["--fingerprint-dir"]).is_err());
         assert!(parse_cli(["--fingerprint-dir="]).is_err());
+        let ids = parse_cli(["--weights", "a.safetensors", "--prompt-ids", "p.txt"]).unwrap();
+        assert_eq!(ids.prompt_ids.as_deref(), Some("p.txt"));
+        assert_eq!(
+            parse_cli(["--weights=a.safetensors", "--prompt-ids=q.txt"])
+                .unwrap()
+                .prompt_ids
+                .as_deref(),
+            Some("q.txt")
+        );
+        assert_eq!(
+            parse_cli(["--ref-ids", "r.txt"])
+                .unwrap()
+                .ref_ids
+                .as_deref(),
+            Some("r.txt")
+        );
+        assert!(parse_cli(["--prompt-ids", "p.txt"]).is_err());
+        assert!(parse_cli(["--prompt-ids"]).is_err());
+        assert!(parse_cli(["--prompt-ids="]).is_err());
+        assert!(parse_cli(["--prompt-ids", "a", "--prompt-ids", "b"]).is_err());
+        assert!(parse_cli(["--block-fixture", "--prompt-ids", "p.txt"]).is_err());
+        assert!(parse_cli([
+            "--weights",
+            "a.safetensors",
+            "--block-fixture",
+            "--prompt-ids",
+            "p.txt"
+        ])
+        .is_err());
+        assert!(parse_cli(["--ref-ids"]).is_err());
+        assert!(parse_cli(["--ref-ids="]).is_err());
+        assert!(parse_cli(["--ref-ids", "a", "--ref-ids", "b"]).is_err());
     }
 
     #[test]
@@ -418,10 +597,11 @@ mod tests {
             kind: RunKind::Weights,
             shape: BlockShape::qwen25_1_5b(),
             prompt_token: SMOKE_PROMPT,
-            n_prompt: N_PROMPT,
+            n_prompt: 1,
             steps: SMOKE_STEPS,
             cmdline: cmdline_from(["myos", "--weights", "model.safetensors"]),
             commit: Some("abc".to_string()),
+            e2_prompt_ids: false,
         });
         assert_eq!(
             weights.model_id.as_deref(),
@@ -450,6 +630,23 @@ mod tests {
         assert_eq!(weights.vocab_size, 151936);
         assert_eq!(weights.prompt_token, 0);
         assert!(weights.notes.contains("not a llama.cpp exact comparison"));
+        assert!(!weights.notes.contains("E2-capable multi-token path"));
+
+        let e2 = RunFingerprint::from_spec(RunSpec {
+            kind: RunKind::Weights,
+            shape: BlockShape::qwen25_1_5b(),
+            prompt_token: 42,
+            n_prompt: 128,
+            steps: 128,
+            cmdline: String::new(),
+            commit: None,
+            e2_prompt_ids: true,
+        });
+        assert_eq!(e2.n_prompt, 128);
+        assert_eq!(e2.n_gen, 128);
+        assert_eq!(e2.n_ctx, 256);
+        assert_eq!(e2.prompt_token, 42);
+        assert!(e2.notes.contains("E2-capable multi-token path"));
 
         let tiny = RunFingerprint::from_spec(RunSpec {
             kind: RunKind::Weights,
@@ -459,6 +656,7 @@ mod tests {
             steps: 4,
             cmdline: String::new(),
             commit: None,
+            e2_prompt_ids: false,
         });
         assert_eq!(tiny.model_id, None);
         assert_eq!(tiny.layout, "not-qwen25-1.5b");
@@ -473,6 +671,7 @@ mod tests {
             steps: 4,
             cmdline: "myos --block-fixture \"a b\"".to_string(),
             commit: None,
+            e2_prompt_ids: false,
         });
         assert_eq!(fixture.model_id, None);
         assert_eq!(fixture.fmt, "in-process");
@@ -588,10 +787,15 @@ mod tests {
             WeightError::DTypeMismatch
         );
 
-        let err = weights_decode(&path, SMOKE_PROMPT, SMOKE_STEPS).unwrap_err();
+        let err = weights_decode(&path, &[SMOKE_PROMPT], SMOKE_STEPS).unwrap_err();
         match err {
             WeightsError::Block(BlockError::Weight(QwenBf16Error::Shape)) => {}
             other => panic!("1.5B shape should reject the miniature file: {other}"),
+        }
+        let err = weights_decode(&path, &[0, 1, 2], 2).unwrap_err();
+        match err {
+            WeightsError::Block(BlockError::Weight(QwenBf16Error::Shape)) => {}
+            other => panic!("a longer prompt still hits the 1.5B shape check: {other}"),
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -606,14 +810,152 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let err = weights_decode(&path, SMOKE_PROMPT, 1).unwrap_err();
+        let err = weights_decode(&path, &[SMOKE_PROMPT], 1).unwrap_err();
         assert!(matches!(err, WeightsError::File(_)), "{err}");
+    }
+
+    #[test]
+    fn parse_prompt_ids_file_accepts_whitespace_and_rejects_empty() {
+        assert_eq!(parse_token_ids("1 2\n3\t4").unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(parse_token_ids("0").unwrap(), vec![0]);
+        assert_eq!(parse_token_ids("4294967295").unwrap(), vec![u32::MAX]);
+        assert!(parse_token_ids("").is_err());
+        assert!(parse_token_ids(" \n\t").is_err());
+        assert!(parse_token_ids("1 -2").is_err());
+        assert!(parse_token_ids("4294967296").is_err());
+        assert!(parse_token_ids("1.5").is_err());
+
+        let dir = std::env::temp_dir().join(format!(
+            "myos-ids-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s1_prompt.token_ids.txt");
+        std::fs::write(&path, "10 20\n30\n").unwrap();
+        assert_eq!(read_token_ids(&path).unwrap(), vec![10, 20, 30]);
+        std::fs::write(&path, "\n").unwrap();
+        assert!(read_token_ids(&path).unwrap_err().contains("empty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_seq_is_prompt_len_plus_steps() {
+        assert_eq!(decode_max_seq(1, 4).unwrap(), 5);
+        assert_eq!(decode_max_seq(128, 128).unwrap(), 256);
+        assert_eq!(decode_max_seq(3, 1).unwrap(), 4);
+        assert!(decode_max_seq(0, 0).is_err());
+        assert!(decode_max_seq(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn correct_line_pass_fail_and_length() {
+        assert_eq!(correct_line(&[1, 2, 3], &[1, 2, 3]), "CORRECT: PASS");
+        assert_eq!(
+            correct_line(&[1, 9, 3], &[1, 2, 3]),
+            "CORRECT: FAIL first_diff@1: got=9 ref=2"
+        );
+        assert_eq!(
+            correct_line(&[1], &[1, 2]),
+            "CORRECT: FAIL length mismatch got=1 ref=2"
+        );
+        assert_eq!(
+            correct_line(&[4, 5], &[4]),
+            "CORRECT: FAIL length mismatch got=2 ref=1"
+        );
+    }
+
+    /// Prompt length 3 needs `max_seq >= 4` once one token is generated.
+    /// `steps + 1` is 2 and cannot hold that prefill.
+    #[test]
+    fn multi_token_prompt_uses_prompt_len_plus_steps() {
+        let weights = block_fixture().unwrap();
+        let shape = fixture_shape();
+        let once = decode_bf16(&weights, shape, &[0, 0, 0], 1).unwrap();
+        let twice = decode_bf16(&weights, shape, &[0, 0, 0], 1).unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(once.len(), 1);
+        assert_eq!(
+            decode_bf16(&weights, shape, &[SMOKE_PROMPT], SMOKE_STEPS).unwrap(),
+            vec![1, 1, 1, 1]
+        );
+        assert_eq!(
+            decode_bf16(&weights, shape, &[], 1).unwrap_err(),
+            BlockError::Shape
+        );
+    }
+
+    #[test]
+    fn prompt_ids_fingerprint_records_length_and_writes_token_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "myos-e2-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cli = Cli {
+            weights: Some("model.safetensors".to_string()),
+            block_fixture: false,
+            steps: 128,
+            fingerprint_dir: Some(dir.display().to_string()),
+            prompt_ids: Some("s1_prompt.token_ids.txt".to_string()),
+            ref_ids: None,
+        };
+        let prompt = [7u32, 8, 9];
+        let generated = [1u32, 1, 1];
+        write_cli_fingerprint(
+            RunKind::Weights,
+            BlockShape::qwen25_1_5b(),
+            &cli,
+            &prompt,
+            Some(&generated),
+        )
+        .unwrap();
+        let json = std::fs::read_to_string(dir.join("run_fingerprint.json")).unwrap();
+        assert!(json.contains("\"n_prompt\": 3"), "{json}");
+        assert!(json.contains("\"n_gen\": 128"), "{json}");
+        assert!(json.contains("\"n_ctx\": 131"), "{json}");
+        assert!(json.contains("\"prompt_token\": 7"), "{json}");
+        assert!(json.contains("E2-capable multi-token path"), "{json}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("token_ids.txt")).unwrap(),
+            "1 1 1\n"
+        );
+
+        let single = Cli {
+            prompt_ids: None,
+            steps: SMOKE_STEPS,
+            fingerprint_dir: Some(dir.join("single").display().to_string()),
+            ..cli
+        };
+        write_cli_fingerprint(
+            RunKind::Weights,
+            BlockShape::qwen25_1_5b(),
+            &single,
+            &[SMOKE_PROMPT],
+            None,
+        )
+        .unwrap();
+        let json = std::fs::read_to_string(dir.join("single/run_fingerprint.json")).unwrap();
+        assert!(json.contains("\"n_prompt\": 1"), "{json}");
+        assert!(json.contains("\"n_gen\": 4"), "{json}");
+        assert!(json.contains("\"n_ctx\": 5"), "{json}");
+        assert!(json.contains("\"prompt_token\": 0"), "{json}");
+        assert!(json.contains("not a llama.cpp exact comparison"), "{json}");
+        assert!(!json.contains("E2-capable multi-token path"), "{json}");
+        assert!(!dir.join("single/token_ids.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn decode_mapped(path: &Path) -> Vec<u32> {
         let mapped = SafeTensorsMmap::open(path).unwrap();
         let weights = mapped.parse().unwrap();
-        decode_bf16(&weights, fixture_shape(), SMOKE_PROMPT, SMOKE_STEPS).unwrap()
+        decode_bf16(&weights, fixture_shape(), &[SMOKE_PROMPT], SMOKE_STEPS).unwrap()
     }
 
     fn write_fixture_safetensors(path: &Path) {

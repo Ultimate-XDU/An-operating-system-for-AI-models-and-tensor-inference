@@ -8,7 +8,7 @@
 
 ## 主推
 
-`--weights PATH`：mmap SafeTensors → 已有 `forward_token` / `prefill` / `greedy_decode`，形状用 `BlockShape::qwen25_1_5b()`。固定 prompt token id `0`，默认 4 步（`--steps N`）。成功行是 `MyOS Phase1 weights decode (prompt=0, steps=N): [...]`。同时写 `runs/s1-weights/run_fingerprint.json`。
+`--weights PATH`：mmap SafeTensors → 已有 `forward_token` / `prefill` / `greedy_decode`，形状用 `BlockShape::qwen25_1_5b()`。未给 `--prompt-ids` 时 prompt token id 是 `0`，默认 4 步（`--steps N`）。成功行是 `MyOS Phase1 weights decode (prompt=0, steps=N): [...]`。同时写 `runs/s1-weights/run_fingerprint.json`。
 
 三门闩：
 
@@ -19,6 +19,8 @@
 默认无参数仍是 cycle `[1, 2, 3, 0]`。`--block-fixture` 仍是进程内微型块。测试不下载 2.88GiB 文件；同路径的自洽用微型 SafeTensors 在 `fixture_shape` 上跑两次。CLI 对那份微型文件必须因 1.5B 形状不符而失败，不能当成夹具解码成功。
 
 指纹里填得了的 §1.3 字段照实写。`model_sha256` 与 `seed` 为 null。`scenario_id` 是占位 `S1`。
+
+E2 宿主 CLI：`--prompt-ids` 在 `--weights` 上预填整段 token id，`max_seq = prompt.len() + steps`；`--ref-ids` 打印 `CORRECT`，不匹配仍退出 0。未给 `--prompt-ids` 时仍是单个 id 0。
 
 ## 未采用
 
