@@ -147,6 +147,21 @@ impl KvCache {
     /// A second store at the same cursor overwrites that layer's slot.
     /// The cursor does not move.
     pub fn store(&mut self, layer: usize, key: &[f32], value: &[f32]) -> Result<(), KvError> {
+        self.store_at(layer, self.len, key, value)
+    }
+
+    /// Write `key` and `value` for `layer` at `pos`. The cursor does not move.
+    ///
+    /// Same layout as [`KvCache::store`]. Prefill uses this to drop a whole
+    /// prompt chunk into `len..len+n` before one [`KvCache::advance`] per
+    /// token. `pos >= max_seq` is [`KvError::Full`].
+    pub fn store_at(
+        &mut self,
+        layer: usize,
+        pos: usize,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<(), KvError> {
         let kv_dim = self.kv_dim()?;
         if key.len() != kv_dim || value.len() != kv_dim {
             return Err(KvError::Shape);
@@ -154,16 +169,55 @@ impl KvCache {
         if layer >= self.shape.num_layers {
             return Err(KvError::Range);
         }
-        if self.len >= self.shape.max_seq {
+        if pos >= self.shape.max_seq {
             return Err(KvError::Full);
         }
-        let pos = self.len;
         let head_dim = self.shape.head_dim;
         for head in 0..self.shape.num_kv_heads {
             let dst = self.offset(layer, head, pos)?;
             let src = head * head_dim;
             self.k[dst..dst + head_dim].copy_from_slice(&key[src..src + head_dim]);
             self.v[dst..dst + head_dim].copy_from_slice(&value[src..src + head_dim]);
+        }
+        Ok(())
+    }
+
+    /// Pack K and V for `gqa_attn_f32` from slots `0..seq`.
+    ///
+    /// Destination layout is `[num_kv_heads, seq, head_dim]`. `dst_k` and
+    /// `dst_v` must be at least that long. `seq` may pass the cursor when
+    /// [`KvCache::store_at`] has already filled those slots. This does not
+    /// write the cache and does not move the cursor.
+    pub fn pack_prefix(
+        &self,
+        layer: usize,
+        seq: usize,
+        dst_k: &mut [f32],
+        dst_v: &mut [f32],
+    ) -> Result<(), KvError> {
+        if layer >= self.shape.num_layers {
+            return Err(KvError::Range);
+        }
+        if seq > self.shape.max_seq {
+            return Err(KvError::Full);
+        }
+        let head_dim = self.shape.head_dim;
+        let need = self
+            .shape
+            .num_kv_heads
+            .checked_mul(seq)
+            .and_then(|n| n.checked_mul(head_dim))
+            .ok_or(KvError::Shape)?;
+        if dst_k.len() < need || dst_v.len() < need {
+            return Err(KvError::Shape);
+        }
+        for head in 0..self.shape.num_kv_heads {
+            for t in 0..seq {
+                let src = self.offset(layer, head, t)?;
+                let dst = (head * seq + t) * head_dim;
+                dst_k[dst..dst + head_dim].copy_from_slice(&self.k[src..src + head_dim]);
+                dst_v[dst..dst + head_dim].copy_from_slice(&self.v[src..src + head_dim]);
+            }
         }
         Ok(())
     }
@@ -403,5 +457,31 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.key_head(0, 0, 0).unwrap(), &[8.0, 9.0]);
         assert_eq!(cache.value_head(0, 0, 0).unwrap(), &[6.0, 7.0]);
+    }
+
+    #[test]
+    fn store_at_writes_ahead_of_the_cursor_and_packs() {
+        let mut cache = KvCache::new(shape(1, 2, 2, 4)).unwrap();
+        cache
+            .store_at(0, 1, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0])
+            .unwrap();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.key_head(0, 0, 1).unwrap(), &[1.0, 2.0]);
+        assert_eq!(cache.value_head(0, 1, 1).unwrap(), &[7.0, 8.0]);
+        assert_eq!(cache.key_head(0, 0, 0).unwrap(), &[0.0, 0.0]);
+        let mut dst_k = vec![0.0f32; 2 * 2 * 2];
+        let mut dst_v = vec![0.0f32; 2 * 2 * 2];
+        cache.pack_prefix(0, 2, &mut dst_k, &mut dst_v).unwrap();
+        // Head 0, positions 0 then 1, then head 1.
+        assert_eq!(dst_k, vec![0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0]);
+        assert_eq!(dst_v, vec![0.0, 0.0, 5.0, 6.0, 0.0, 0.0, 7.0, 8.0]);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(
+            cache
+                .store_at(0, 4, &[1.0, 0.0, 0.0, 0.0], &[0.0; 4])
+                .unwrap_err(),
+            KvError::Full
+        );
+        assert_eq!(cache.key_head(0, 0, 1).unwrap(), &[1.0, 2.0]);
     }
 }

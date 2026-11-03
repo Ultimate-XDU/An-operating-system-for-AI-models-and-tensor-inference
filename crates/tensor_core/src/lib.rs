@@ -38,9 +38,13 @@
 //! [`gemv_bf16_threads`] workers. The showdown default is [`SHOWDOWN_THREADS`]
 //! (8). Workers do not reduce across rows. Panel pack stays off unless
 //! [`set_gemv_bf16_panel_pack`] is set.
+//! [`gemm_bf16`] is the prompt-chunk form of that same chain: one weight row
+//! dots every token in the chunk, `j` from `0` to `k - 1`, multiply then add.
+//! It does not pack `W`. Decode stays on [`gemv_bf16`].
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 mod bf16;
+mod gemm_bf16;
 mod gemv_bf16_kernel;
 #[cfg(any(feature = "std", test))]
 mod gemv_pool;
@@ -51,6 +55,7 @@ pub use bf16::{
     add_bf16_bias, bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32,
     Bf16OpError, ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
 };
+pub use gemm_bf16::{gemm_bf16, gemm_bf16_scratch_elems, GEMM_ROW_BLOCK};
 pub use gemv_bf16_kernel::{
     gemv_bf16_panel_pack, gemv_bf16_threads, gemv_row_spans, set_gemv_bf16_panel_pack,
     set_gemv_bf16_prefetch, set_gemv_bf16_threads, GemvRowSpans, GEMV_THREADS_MAX,

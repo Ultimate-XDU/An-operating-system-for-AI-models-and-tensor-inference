@@ -11,6 +11,7 @@
 - gemv_pack: false
 - deterministic: ON (greedy argmax). seed: null (no RNG)
 - n_ctx=256, n_prompt=128, n_gen=128
+- n_ctx：协议 S1 表写 `n_ctx≥512`；本卡 `n_ctx=256` 对 128+128 可跑。对齐表文可后补，不挡刀⑦收口。
 - protocol: W=3 discard, R=5 median
 - challenger commit: 9577e666e8bad102763f847b6eacb4aacf233ffa
 - baseline: llama.cpp b11960 `s1-llamacpp-bf16-b11960` threads=8

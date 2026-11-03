@@ -7,6 +7,8 @@
 //! [`KvCache`] stores per-layer K and V. [`attention_layer`] runs one attention
 //! layer into that cache and does not advance it. [`forward_token`] runs every
 //! block, the final norm, and the tied embedding head, then advances once.
+//! [`prefill`] runs the prompt as one chunk instead of calling `forward_token`
+//! once per prompt id. Decode stays on `forward_token`.
 //! The stub calls none of those.
 #![cfg_attr(not(test), no_std)]
 

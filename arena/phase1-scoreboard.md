@@ -1,8 +1,8 @@
 # Phase1 Scoreboard（评测账本）
 
 **协议**：`PHASE1-ARENA-PROTOCOL-v0.1.md`  
-**更新**：2026-11-03 17:40 UTC+8 · 刀⑦ host `--arena-s1` 已填中位（CORRECT/DET PASS，场景 L）  
-**合入**：交 OSdeveloper 推仓（本文件不直接 git push）
+**更新**：2026-11-03 · 刀⑦已合 main @ `a92677f1`；刀⑧ Prefill/TTFT 代码落地，中位 UNMEASURED  
+**合入**：刀⑦ PR #39 已在 main。刀⑧ 指纹另开，host 补测前不改刀⑦数字。
 
 ---
 
@@ -23,7 +23,8 @@
 | 实现 | run_id | DET | CORRECT | T_decode | L_TTFT ms | L_TPOT ms | M_peak MiB | 备注 |
 |------|--------|-----|---------|----------|-----------|-----------|------------|------|
 | llama.cpp b11960 | `s1-llamacpp-bf16-b11960` | PASS | 金标准 | 17.2348 | 608.110 | 58.022 | 3050.953 | 自转 GGUF BF16；`-t 8`；E2 ref；ratio 分母 |
-| MyOS threads=8（刀⑦） | `s1-myos-bf16-t8` | **PASS** | **PASS** | 14.3503 | 9092.903 | 69.685 | 2963.383 | host 2026-11-03 15:02 UTC+8；`bf16` / `bf16_w_fp32_acc`，batch=1，`gemv_pack=false`；commit `9577e66`。卡：`arena/s1-myos-bf16-cost-card.md` |
+| MyOS threads=8（刀⑦） | `s1-myos-bf16-t8` | **PASS** | **PASS** | 14.3503 | 9092.903 | 69.685 | 2963.383 | host 2026-11-03 15:02 UTC+8；`bf16` / `bf16_w_fp32_acc`，batch=1，`gemv_pack=false`；commit `9577e66`。卡：`arena/s1-myos-bf16-cost-card.md`。已合 main @ `a92677f1` |
+| MyOS threads=8（刀⑧ prefill） | `s1-myos-bf16-t8-k8` | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | 整段 chunk prefill 已落地；exact 由单测对 serial `forward_token`。本环境无 1.5B 权重。卡：`arena/s1-myos-bf16-t8-k8-cost-card.md`。口径：`docs/phase1-knife7-verdict-and-knife8.md` |
 | MyOS `42acbb39` | `e2-myos-s1` | （单次 greedy） | **PASS** exact 128/128 | — | — | — | — | 历史正确性收口；指纹 threads=1，**不**拿来和 `-t 8` 比吞吐 |
 | llama.cpp b11960 | `s1-llamacpp-fp16-b11960` | PASS | （非 E2 ref） | 18.84 | 841.1 | 53.07 | 6377 | 官方 FP16；并列主赛道参考，非本 E2 金标准 |
 
@@ -62,7 +63,7 @@
 
 ## 下一步（协议 §8）
 
-1. ~~host 重跑刀⑦ `--arena-s1`~~ **已完成**（2026-11-03 15:02 UTC+8）。账本与 cost-card 已填。交 OSdeveloper 把 `arena/phase1-scoreboard.md` + cost-card 推上 [PR #39](https://github.com/Ultimate-XDU/An-operating-system-for-AI-models-and-tensor-inference/pull/39) 后再合入。
-2. E1 补 S2/S3/S6 基线（若尚未闭合）
-3. 副赛道保持关闭，除非月星/协议升版
-4. 场景 L 的主因是 L_TTFT（约 15× llama）；下一刀若继续吞吐，应先钉 prefill 路径，而不是再拆标量 GEMV 微刀
+1. 刀⑦已合 main @ `a92677f1`（PR #39）。账本刀⑦行与 `arena/s1-myos-bf16-cost-card.md` 是该收口的 host 中位。
+2. 刀⑧ Prefill/TTFT：整段 prompt 分块 prefill，指纹 `s1-myos-bf16-t8-k8`。本环境 CORRECT/DET/中位 **UNMEASURED**。host `--arena-s1` 补测命令见 `docs/phase1-knife7-verdict-and-knife8.md`。
+3. E1 补 S2/S3/S6 基线（若尚未闭合）
+4. 副赛道保持关闭，除非月星/协议升版

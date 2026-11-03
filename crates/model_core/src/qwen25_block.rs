@@ -3,9 +3,11 @@
 //! Control flow follows ember `Model::forward` (MIT, Copyright (c) 2026 Ali
 //! Zulfiqar, <https://github.com/codewithfourtix/ember> `src/model.rs`): for
 //! each layer, RMSNorm, attention, residual, RMSNorm, SwiGLU, residual; then
-//! the final norm and a matvec with the token embedding. The prefill / greedy
-//! loop follows ember `src/main.rs` only as far as token ids: this module does
-//! not tokenize.
+//! the final norm and a matvec with the token embedding. The greedy loop
+//! follows ember `src/main.rs` only as far as token ids: this module does
+//! not tokenize. Prefill runs the prompt as one chunk (projections and a
+//! causal KV write), not `n_prompt` calls of [`forward_token`]. Decode stays
+//! on [`forward_token`].
 //!
 //! Weights stay little-endian BF16 views from [`crate::qwen25_bf16`]. Promotion
 //! stays inside `tensor_core` (`quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc`).
@@ -25,8 +27,9 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use tensor_core::{
-    embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, swiglu_bf16, Bf16OpError, SwigluShape,
-    RMS_NORM_EPS_QWEN25,
+    add_bf16_bias, embed_gather_bf16, gemm_bf16, gemm_bf16_scratch_elems, gemv_bf16,
+    gemv_bf16_threads, gqa_attn_f32, rmsnorm_bf16_weight, rope_f32_inplace, swiglu_bf16,
+    swiglu_mul_f32, Bf16OpError, GqaMask, GqaShape, SwigluShape, RMS_NORM_EPS_QWEN25,
 };
 use weight_loader::{MmapWeights, WeightMap};
 
@@ -35,8 +38,10 @@ use crate::greedy_token;
 use crate::kv_cache::{KvCache, KvError};
 use crate::qwen25_bf16::{bf16_tensor, QwenBf16Error};
 use crate::qwen25_layout::{
-    down_proj_weight_key, gate_proj_weight_key, input_layernorm_key, post_attention_layernorm_key,
-    up_proj_weight_key, EMBED_TOKENS, FINAL_NORM, INTERMEDIATE_SIZE, NUM_HIDDEN_LAYERS, VOCAB_SIZE,
+    down_proj_weight_key, gate_proj_weight_key, input_layernorm_key, k_proj_bias_key,
+    k_proj_weight_key, o_proj_weight_key, post_attention_layernorm_key, q_proj_bias_key,
+    q_proj_weight_key, up_proj_weight_key, v_proj_bias_key, v_proj_weight_key, EMBED_TOKENS,
+    FINAL_NORM, INTERMEDIATE_SIZE, NUM_HIDDEN_LAYERS, VOCAB_SIZE,
 };
 
 /// Widths for [`forward_token`].
@@ -298,11 +303,23 @@ pub fn forward_token<'a>(
     Ok(&work.logits)
 }
 
-/// Feed each prompt id through [`forward_token`], in order.
+/// Run every prompt id as one chunk, then advance the cache once per token.
 ///
-/// Positions are `cache.len()..`. An empty prompt is [`BlockError::Shape`] and
-/// does not touch the cache. Each token advances the cache once inside
-/// `forward_token`. The returned slice is the logits after the last prompt token.
+/// This is not [`forward_token`] in a loop. One layer projects Q, K, V, the
+/// output, and the SwiGLU matrices for the whole chunk ([`gemm_bf16`]),
+/// writes that layer's K and V, then scores each query with
+/// [`gqa_attn_f32`] and [`GqaMask::Causal`]. Each `(token, row)` dot is still
+/// `j = 0..k-1`, multiply then add, so the chunk matches a serial
+/// [`forward_token`] on the success path: same KV slots, and the same logits
+/// for the last prompt id.
+///
+/// The tied head runs only on that last id. Earlier prompt logits are unused.
+/// Decode stays on [`forward_token`].
+///
+/// Positions are `cache.len()..`. An empty prompt, a token outside `vocab`,
+/// or a missing weight is an error and does not move the cursor or write a
+/// slot. The cursor advances only after every layer and the tied head have
+/// finished.
 pub fn prefill<'a>(
     tokens: &[u32],
     map: &impl WeightMap,
@@ -313,12 +330,431 @@ pub fn prefill<'a>(
     if tokens.is_empty() {
         return Err(BlockError::Shape);
     }
+    let n = tokens.len();
     let start = cache.len();
+    ready(shape, cache, work, start)?;
+    let end = start.checked_add(n).ok_or(BlockError::Shape)?;
+    if end > cache.max_seq() {
+        return Err(BlockError::Cache(KvError::Full));
+    }
+    let hidden = shape.attn.hidden;
+    let q_dim = shape
+        .attn
+        .num_q_heads
+        .checked_mul(shape.attn.head_dim)
+        .ok_or(BlockError::Shape)?;
+    let kv_dim = shape
+        .attn
+        .num_kv_heads
+        .checked_mul(shape.attn.head_dim)
+        .ok_or(BlockError::Shape)?;
+    if shape.attn.head_dim == 0 || shape.attn.head_dim % 2 != 0 {
+        return Err(BlockError::Shape);
+    }
+    for &token in tokens {
+        if token as usize >= shape.vocab {
+            return Err(BlockError::Token);
+        }
+    }
+    let _ = u32::try_from(end - 1).map_err(|_| BlockError::Position)?;
+    preflight_weights(map, shape, hidden, q_dim, kv_dim)?;
+
+    let mut buf = PrefillBuf::new(shape, n, end, hidden, q_dim, kv_dim)?;
+    let embed =
+        bf16_tensor(map, EMBED_TOKENS, &[shape.vocab, hidden]).map_err(BlockError::Weight)?;
     for (i, &token) in tokens.iter().enumerate() {
-        let pos = start.checked_add(i).ok_or(BlockError::Shape)?;
-        forward_token(token, pos, map, shape, cache, work)?;
+        let s = i * hidden;
+        embed_gather_bf16(&mut buf.x[s..s + hidden], embed.bytes, embed.shape, token)
+            .map_err(map_op)?;
+    }
+
+    for layer in 0..shape.num_layers {
+        let ln =
+            bf16_tensor(map, &input_layernorm_key(layer), &[hidden]).map_err(BlockError::Weight)?;
+        norm_all(&mut buf.normed, &buf.x, ln.bytes, n, hidden, shape.rms_eps)?;
+        let q_w = bf16_tensor(map, &q_proj_weight_key(layer), &[q_dim, hidden])
+            .map_err(BlockError::Weight)?;
+        let k_w = bf16_tensor(map, &k_proj_weight_key(layer), &[kv_dim, hidden])
+            .map_err(BlockError::Weight)?;
+        let v_w = bf16_tensor(map, &v_proj_weight_key(layer), &[kv_dim, hidden])
+            .map_err(BlockError::Weight)?;
+        let q_b =
+            bf16_tensor(map, &q_proj_bias_key(layer), &[q_dim]).map_err(BlockError::Weight)?;
+        let k_b =
+            bf16_tensor(map, &k_proj_bias_key(layer), &[kv_dim]).map_err(BlockError::Weight)?;
+        let v_b =
+            bf16_tensor(map, &v_proj_bias_key(layer), &[kv_dim]).map_err(BlockError::Weight)?;
+        let o_w = bf16_tensor(map, &o_proj_weight_key(layer), &[hidden, q_dim])
+            .map_err(BlockError::Weight)?;
+        project(
+            &mut buf.q,
+            q_w.bytes,
+            &buf.normed,
+            n,
+            q_dim,
+            hidden,
+            &mut buf.gemm,
+        )?;
+        project(
+            &mut buf.k,
+            k_w.bytes,
+            &buf.normed,
+            n,
+            kv_dim,
+            hidden,
+            &mut buf.gemm,
+        )?;
+        project(
+            &mut buf.v,
+            v_w.bytes,
+            &buf.normed,
+            n,
+            kv_dim,
+            hidden,
+            &mut buf.gemm,
+        )?;
+        bias_rope_store(
+            &mut buf.q,
+            &mut buf.k,
+            &mut buf.v,
+            q_b.bytes,
+            k_b.bytes,
+            v_b.bytes,
+            n,
+            q_dim,
+            kv_dim,
+            start,
+            shape.attn.head_dim,
+            shape.attn.rope_theta,
+            layer,
+            cache,
+        )?;
+        attend_chunk(
+            &mut buf.att,
+            &buf.q,
+            &mut buf.pack_k,
+            &mut buf.pack_v,
+            &mut buf.probs,
+            cache,
+            layer,
+            start,
+            end,
+            n,
+            shape,
+            q_dim,
+        )?;
+        project(
+            &mut buf.proj,
+            o_w.bytes,
+            &buf.att,
+            n,
+            hidden,
+            q_dim,
+            &mut buf.gemm,
+        )?;
+        add_tokens(&mut buf.x, &buf.proj, n, hidden);
+
+        let post = bf16_tensor(map, &post_attention_layernorm_key(layer), &[hidden])
+            .map_err(BlockError::Weight)?;
+        norm_all(
+            &mut buf.normed,
+            &buf.x,
+            post.bytes,
+            n,
+            hidden,
+            shape.rms_eps,
+        )?;
+        let gate_w = bf16_tensor(
+            map,
+            &gate_proj_weight_key(layer),
+            &[shape.intermediate, hidden],
+        )
+        .map_err(BlockError::Weight)?;
+        let up_w = bf16_tensor(
+            map,
+            &up_proj_weight_key(layer),
+            &[shape.intermediate, hidden],
+        )
+        .map_err(BlockError::Weight)?;
+        let down_w = bf16_tensor(
+            map,
+            &down_proj_weight_key(layer),
+            &[hidden, shape.intermediate],
+        )
+        .map_err(BlockError::Weight)?;
+        project(
+            &mut buf.gate,
+            gate_w.bytes,
+            &buf.normed,
+            n,
+            shape.intermediate,
+            hidden,
+            &mut buf.gemm,
+        )?;
+        project(
+            &mut buf.up,
+            up_w.bytes,
+            &buf.normed,
+            n,
+            shape.intermediate,
+            hidden,
+            &mut buf.gemm,
+        )?;
+        for i in 0..n {
+            let s = i * shape.intermediate;
+            let e = s + shape.intermediate;
+            swiglu_mul_f32(&mut buf.act[s..e], &buf.gate[s..e], &buf.up[s..e])
+                .map_err(|_| BlockError::Shape)?;
+        }
+        project(
+            &mut buf.proj,
+            down_w.bytes,
+            &buf.act,
+            n,
+            hidden,
+            shape.intermediate,
+            &mut buf.gemm,
+        )?;
+        add_tokens(&mut buf.x, &buf.proj, n, hidden);
+    }
+
+    let final_ln = bf16_tensor(map, FINAL_NORM, &[hidden]).map_err(BlockError::Weight)?;
+    let last = (n - 1) * hidden;
+    rmsnorm_bf16_weight(
+        &mut work.normed,
+        final_ln.bytes,
+        &buf.x[last..last + hidden],
+        shape.rms_eps,
+    )
+    .map_err(map_op)?;
+    work.x.copy_from_slice(&buf.x[last..last + hidden]);
+    gemv_bf16(
+        &mut work.logits,
+        embed.bytes,
+        &work.normed,
+        shape.vocab,
+        hidden,
+    )
+    .map_err(map_op)?;
+    for _ in 0..n {
+        cache.advance().map_err(BlockError::Cache)?;
     }
     Ok(&work.logits)
+}
+
+struct PrefillBuf {
+    x: Vec<f32>,
+    normed: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    att: Vec<f32>,
+    proj: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    act: Vec<f32>,
+    pack_k: Vec<f32>,
+    pack_v: Vec<f32>,
+    probs: Vec<f32>,
+    gemm: Vec<f32>,
+}
+
+impl PrefillBuf {
+    fn new(
+        shape: BlockShape,
+        n: usize,
+        seq: usize,
+        hidden: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) -> Result<Self, BlockError> {
+        let k_max = hidden.max(q_dim).max(shape.intermediate);
+        let gemm_len =
+            gemm_bf16_scratch_elems(n, k_max, gemv_bf16_threads()).ok_or(BlockError::Shape)?;
+        let pack = shape
+            .attn
+            .num_kv_heads
+            .checked_mul(seq)
+            .and_then(|v| v.checked_mul(shape.attn.head_dim))
+            .ok_or(BlockError::Shape)?;
+        Ok(Self {
+            x: zeros(n.checked_mul(hidden).ok_or(BlockError::Shape)?),
+            normed: zeros(n.checked_mul(hidden).ok_or(BlockError::Shape)?),
+            q: zeros(n.checked_mul(q_dim).ok_or(BlockError::Shape)?),
+            k: zeros(n.checked_mul(kv_dim).ok_or(BlockError::Shape)?),
+            v: zeros(n.checked_mul(kv_dim).ok_or(BlockError::Shape)?),
+            att: zeros(n.checked_mul(q_dim).ok_or(BlockError::Shape)?),
+            proj: zeros(n.checked_mul(hidden).ok_or(BlockError::Shape)?),
+            gate: zeros(n.checked_mul(shape.intermediate).ok_or(BlockError::Shape)?),
+            up: zeros(n.checked_mul(shape.intermediate).ok_or(BlockError::Shape)?),
+            act: zeros(n.checked_mul(shape.intermediate).ok_or(BlockError::Shape)?),
+            pack_k: zeros(pack),
+            pack_v: zeros(pack),
+            probs: zeros(seq),
+            gemm: zeros(gemm_len),
+        })
+    }
+}
+
+fn preflight_weights(
+    map: &impl WeightMap,
+    shape: BlockShape,
+    hidden: usize,
+    q_dim: usize,
+    kv_dim: usize,
+) -> Result<(), BlockError> {
+    bf16_tensor(map, EMBED_TOKENS, &[shape.vocab, hidden]).map_err(BlockError::Weight)?;
+    bf16_tensor(map, FINAL_NORM, &[hidden]).map_err(BlockError::Weight)?;
+    for layer in 0..shape.num_layers {
+        bf16_tensor(map, &input_layernorm_key(layer), &[hidden]).map_err(BlockError::Weight)?;
+        bf16_tensor(map, &q_proj_weight_key(layer), &[q_dim, hidden])
+            .map_err(BlockError::Weight)?;
+        bf16_tensor(map, &q_proj_bias_key(layer), &[q_dim]).map_err(BlockError::Weight)?;
+        bf16_tensor(map, &k_proj_weight_key(layer), &[kv_dim, hidden])
+            .map_err(BlockError::Weight)?;
+        bf16_tensor(map, &k_proj_bias_key(layer), &[kv_dim]).map_err(BlockError::Weight)?;
+        bf16_tensor(map, &v_proj_weight_key(layer), &[kv_dim, hidden])
+            .map_err(BlockError::Weight)?;
+        bf16_tensor(map, &v_proj_bias_key(layer), &[kv_dim]).map_err(BlockError::Weight)?;
+        bf16_tensor(map, &o_proj_weight_key(layer), &[hidden, q_dim])
+            .map_err(BlockError::Weight)?;
+        bf16_tensor(map, &post_attention_layernorm_key(layer), &[hidden])
+            .map_err(BlockError::Weight)?;
+        bf16_tensor(
+            map,
+            &gate_proj_weight_key(layer),
+            &[shape.intermediate, hidden],
+        )
+        .map_err(BlockError::Weight)?;
+        bf16_tensor(
+            map,
+            &up_proj_weight_key(layer),
+            &[shape.intermediate, hidden],
+        )
+        .map_err(BlockError::Weight)?;
+        bf16_tensor(
+            map,
+            &down_proj_weight_key(layer),
+            &[hidden, shape.intermediate],
+        )
+        .map_err(BlockError::Weight)?;
+    }
+    Ok(())
+}
+
+fn project(
+    y: &mut [f32],
+    w: &[u8],
+    x: &[f32],
+    batch: usize,
+    m: usize,
+    k: usize,
+    scratch: &mut [f32],
+) -> Result<(), BlockError> {
+    gemm_bf16(y, w, x, batch, m, k, scratch).map_err(map_op)
+}
+
+fn norm_all(
+    dst: &mut [f32],
+    src: &[f32],
+    gamma: &[u8],
+    n: usize,
+    dim: usize,
+    eps: f32,
+) -> Result<(), BlockError> {
+    for i in 0..n {
+        let s = i * dim;
+        rmsnorm_bf16_weight(&mut dst[s..s + dim], gamma, &src[s..s + dim], eps).map_err(map_op)?;
+    }
+    Ok(())
+}
+
+fn add_tokens(y: &mut [f32], x: &[f32], n: usize, dim: usize) {
+    for i in 0..n {
+        let s = i * dim;
+        add_assign(&mut y[s..s + dim], &x[s..s + dim]);
+    }
+}
+
+fn bias_rope_store(
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    q_b: &[u8],
+    k_b: &[u8],
+    v_b: &[u8],
+    n: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    start: usize,
+    head_dim: usize,
+    theta: f32,
+    layer: usize,
+    cache: &mut KvCache,
+) -> Result<(), BlockError> {
+    for i in 0..n {
+        let qs = i * q_dim;
+        let ks = i * kv_dim;
+        add_bf16_bias(&mut q[qs..qs + q_dim], q_b).map_err(map_op)?;
+        add_bf16_bias(&mut k[ks..ks + kv_dim], k_b).map_err(map_op)?;
+        add_bf16_bias(&mut v[ks..ks + kv_dim], v_b).map_err(map_op)?;
+        let pos = start + i;
+        let pos_u = u32::try_from(pos).map_err(|_| BlockError::Position)?;
+        rope_f32_inplace(&mut q[qs..qs + q_dim], pos_u, head_dim, theta)
+            .map_err(|_| BlockError::Shape)?;
+        rope_f32_inplace(&mut k[ks..ks + kv_dim], pos_u, head_dim, theta)
+            .map_err(|_| BlockError::Shape)?;
+        cache
+            .store_at(layer, pos, &k[ks..ks + kv_dim], &v[ks..ks + kv_dim])
+            .map_err(BlockError::Cache)?;
+    }
+    Ok(())
+}
+
+fn attend_chunk(
+    att: &mut [f32],
+    q: &[f32],
+    pack_k: &mut [f32],
+    pack_v: &mut [f32],
+    probs: &mut [f32],
+    cache: &KvCache,
+    layer: usize,
+    start: usize,
+    end: usize,
+    n: usize,
+    shape: BlockShape,
+    q_dim: usize,
+) -> Result<(), BlockError> {
+    cache
+        .pack_prefix(layer, end, pack_k, pack_v)
+        .map_err(BlockError::Cache)?;
+    let packed = shape
+        .attn
+        .num_kv_heads
+        .checked_mul(end)
+        .and_then(|v| v.checked_mul(shape.attn.head_dim))
+        .ok_or(BlockError::Shape)?;
+    for i in 0..n {
+        let s = i * q_dim;
+        gqa_attn_f32(
+            &mut att[s..s + q_dim],
+            &q[s..s + q_dim],
+            &pack_k[..packed],
+            &pack_v[..packed],
+            &mut probs[..end],
+            GqaShape {
+                num_q_heads: shape.attn.num_q_heads,
+                num_kv_heads: shape.attn.num_kv_heads,
+                head_dim: shape.attn.head_dim,
+                seq_len: end,
+            },
+            GqaMask::Causal {
+                query_pos: start + i,
+            },
+        )
+        .map_err(|_| BlockError::Shape)?;
+    }
+    Ok(())
 }
 
 /// Greedy-decode `steps` tokens from the logits already in `work`.
@@ -861,5 +1297,218 @@ mod tests {
         assert_eq!(full.len(), 1);
         assert_eq!(full.value_head(0, 0, 0).unwrap(), &[1.0, 0.0]);
         assert_eq!(work_full.logits(), &before);
+    }
+
+    fn pat(i: usize) -> f32 {
+        const V: [f32; 8] = [0.5, -0.25, 1.0, 0.0, -1.0, 0.125, 2.0, -0.5];
+        V[i % 8]
+    }
+
+    fn put_pat(map: &mut MmapWeights, name: &str, shape: &[usize], salt: usize) {
+        let n = shape.iter().product();
+        let vals: Vec<f32> = (0..n).map(|i| pat(i + salt)).collect();
+        put(map, name, shape, &vals).unwrap();
+    }
+
+    fn rich_map(shape: BlockShape) -> MmapWeights {
+        use crate::qwen25_layout::{
+            down_proj_weight_key, gate_proj_weight_key, input_layernorm_key, k_proj_bias_key,
+            k_proj_weight_key, o_proj_weight_key, post_attention_layernorm_key, q_proj_bias_key,
+            q_proj_weight_key, up_proj_weight_key, v_proj_bias_key, v_proj_weight_key, FINAL_NORM,
+        };
+        let hidden = shape.attn.hidden;
+        let q_dim = shape.attn.num_q_heads * shape.attn.head_dim;
+        let kv_dim = shape.attn.num_kv_heads * shape.attn.head_dim;
+        let inter = shape.intermediate;
+        let mut map = MmapWeights::new();
+        put_pat(&mut map, EMBED_TOKENS, &[shape.vocab, hidden], 1);
+        put_pat(&mut map, FINAL_NORM, &[hidden], 2);
+        for layer in 0..shape.num_layers {
+            let salt = 10 + layer * 20;
+            put_pat(&mut map, &input_layernorm_key(layer), &[hidden], salt);
+            put_pat(
+                &mut map,
+                &q_proj_weight_key(layer),
+                &[q_dim, hidden],
+                salt + 1,
+            );
+            put_pat(&mut map, &q_proj_bias_key(layer), &[q_dim], salt + 2);
+            put_pat(
+                &mut map,
+                &k_proj_weight_key(layer),
+                &[kv_dim, hidden],
+                salt + 3,
+            );
+            put_pat(&mut map, &k_proj_bias_key(layer), &[kv_dim], salt + 4);
+            put_pat(
+                &mut map,
+                &v_proj_weight_key(layer),
+                &[kv_dim, hidden],
+                salt + 5,
+            );
+            put_pat(&mut map, &v_proj_bias_key(layer), &[kv_dim], salt + 6);
+            put_pat(
+                &mut map,
+                &o_proj_weight_key(layer),
+                &[hidden, q_dim],
+                salt + 7,
+            );
+            put_pat(
+                &mut map,
+                &post_attention_layernorm_key(layer),
+                &[hidden],
+                salt + 8,
+            );
+            put_pat(
+                &mut map,
+                &gate_proj_weight_key(layer),
+                &[inter, hidden],
+                salt + 9,
+            );
+            put_pat(
+                &mut map,
+                &up_proj_weight_key(layer),
+                &[inter, hidden],
+                salt + 10,
+            );
+            put_pat(
+                &mut map,
+                &down_proj_weight_key(layer),
+                &[hidden, inter],
+                salt + 11,
+            );
+        }
+        map
+    }
+
+    fn logit_bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn kv_bits(cache: &KvCache) -> Vec<u32> {
+        let shape = cache.shape();
+        let mut bits = Vec::new();
+        for layer in 0..shape.num_layers {
+            for head in 0..shape.num_kv_heads {
+                for pos in 0..cache.len() {
+                    for lane in cache.key_head(layer, head, pos).unwrap() {
+                        bits.push(lane.to_bits());
+                    }
+                    for lane in cache.value_head(layer, head, pos).unwrap() {
+                        bits.push(lane.to_bits());
+                    }
+                }
+            }
+        }
+        bits
+    }
+
+    fn serial_prefill(
+        tokens: &[u32],
+        map: &MmapWeights,
+        shape: BlockShape,
+        cache: &mut KvCache,
+        work: &mut BlockWorkspace,
+    ) -> Vec<u32> {
+        let start = cache.len();
+        let mut last = Vec::new();
+        for (i, &token) in tokens.iter().enumerate() {
+            let logits = forward_token(token, start + i, map, shape, cache, work).unwrap();
+            last = logit_bits(logits);
+        }
+        last
+    }
+
+    #[test]
+    fn chunk_prefill_matches_serial_forward_token_bits() {
+        let shape = BlockShape {
+            attn: AttnShape {
+                hidden: 8,
+                num_q_heads: 4,
+                num_kv_heads: 2,
+                head_dim: 2,
+                rope_theta: tensor_core::ROPE_THETA_QWEN25,
+            },
+            intermediate: 6,
+            vocab: 5,
+            num_layers: 2,
+            rms_eps: 1e-6,
+        };
+        let map = rich_map(shape);
+        let prompt = [1u32, 3, 0, 4, 2];
+        let mut cache_s = cache_for(shape, 16);
+        let mut work_s = BlockWorkspace::new(shape, 16).unwrap();
+        let mut cache_c = cache_for(shape, 16);
+        let mut work_c = BlockWorkspace::new(shape, 16).unwrap();
+        // A committed prefix, so the chunk does not start at position 0.
+        forward_token(2, 0, &map, shape, &mut cache_s, &mut work_s).unwrap();
+        forward_token(2, 0, &map, shape, &mut cache_c, &mut work_c).unwrap();
+        let serial_logits = serial_prefill(&prompt, &map, shape, &mut cache_s, &mut work_s);
+        let chunk_logits =
+            logit_bits(prefill(&prompt, &map, shape, &mut cache_c, &mut work_c).unwrap());
+        assert_eq!(chunk_logits, serial_logits);
+        assert_eq!(cache_c.len(), cache_s.len());
+        assert_eq!(kv_bits(&cache_c), kv_bits(&cache_s));
+
+        let mut out_s = Vec::new();
+        let mut out_c = Vec::new();
+        greedy_decode(3, &map, shape, &mut cache_s, &mut work_s, &mut out_s).unwrap();
+        greedy_decode(3, &map, shape, &mut cache_c, &mut work_c, &mut out_c).unwrap();
+        assert_eq!(out_c, out_s);
+        assert_eq!(logit_bits(work_c.logits()), logit_bits(work_s.logits()));
+        assert_eq!(kv_bits(&cache_c), kv_bits(&cache_s));
+
+        // Batch tails: 33 is not a multiple of 8, 32, or 64.
+        let wide = BlockShape {
+            num_layers: 1,
+            ..shape
+        };
+        let map33 = rich_map(wide);
+        let tokens: Vec<u32> = (0..33).map(|i| (i % 5) as u32).collect();
+        let mut cache_s = cache_for(wide, 40);
+        let mut work_s = BlockWorkspace::new(wide, 40).unwrap();
+        let mut cache_c = cache_for(wide, 40);
+        let mut work_c = BlockWorkspace::new(wide, 40).unwrap();
+        let serial_logits = serial_prefill(&tokens, &map33, wide, &mut cache_s, &mut work_s);
+        let chunk_logits =
+            logit_bits(prefill(&tokens, &map33, wide, &mut cache_c, &mut work_c).unwrap());
+        assert_eq!(chunk_logits, serial_logits);
+        assert_eq!(cache_c.len(), 33);
+        assert_eq!(kv_bits(&cache_c), kv_bits(&cache_s));
+    }
+
+    #[test]
+    fn chunk_prefill_rejects_before_any_store() {
+        let shape = fixture_shape();
+        let weights = block_fixture().unwrap();
+        let mut cache = cache_for(shape, 4);
+        let mut work = BlockWorkspace::new(shape, 4).unwrap();
+        assert_eq!(
+            prefill(&[0, 9], &weights, shape, &mut cache, &mut work).unwrap_err(),
+            BlockError::Token
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.value_head(0, 0, 0).unwrap(), &[0.0, 0.0]);
+        assert_eq!(work.logits(), &[0.0; 4]);
+
+        let mut small = cache_for(shape, 2);
+        let mut work_small = BlockWorkspace::new(shape, 2).unwrap();
+        assert_eq!(
+            prefill(&[0, 0, 0], &weights, shape, &mut small, &mut work_small).unwrap_err(),
+            BlockError::Cache(KvError::Full)
+        );
+        assert_eq!(small.len(), 0);
+        assert_eq!(small.value_head(0, 0, 0).unwrap(), &[0.0, 0.0]);
+
+        let mut partial = MmapWeights::new();
+        insert_embed_and_final(&mut partial, shape).unwrap();
+        let mut cache2 = cache_for(shape, 4);
+        let mut work2 = BlockWorkspace::new(shape, 4).unwrap();
+        assert_eq!(
+            prefill(&[0, 1], &partial, shape, &mut cache2, &mut work2).unwrap_err(),
+            BlockError::Weight(QwenBf16Error::Missing)
+        );
+        assert_eq!(cache2.len(), 0);
+        assert_eq!(cache2.value_head(0, 0, 0).unwrap(), &[0.0, 0.0]);
     }
 }
