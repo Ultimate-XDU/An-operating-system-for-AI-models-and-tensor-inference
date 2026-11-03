@@ -67,7 +67,13 @@ Pairing is NeoX / half-rotate, the same layout as HF Qwen2 `rotate_half` and lla
 
 Layout, no batch axis: Q and Y are `[num_q_heads, head_dim]`. K and V are `[num_kv_heads, seq_len, head_dim]`. `scale = 1 / sqrtf(head_dim)` once (`attn_scale_f32`), then each score is `dot * scale` after a left-to-right dot (multiply, then add; not `mul_add`). Softmax is one thread over the visible keys: max starts at key 0 (`>`), `expf(score - max)`, left-to-right sum, then `e / sum` (division, not a reciprocal multiply). The value mix is the same left-to-right order. `probs` is scratch of length `seq_len`; on success it holds the last query head.
 
-`GqaMask::Full` scores the whole cache (decode that already stored only the legal prefix). `GqaMask::Causal { query_pos }` drops key index `t > query_pos` before the dot, so those V slots are not read. `query_pos >= seq_len - 1` keeps every key. A zero count, a query-head count that is not a multiple of the KV-head count, or a bad buffer length returns `Err` and does not write. KV-cache allocation, SwiGLU, and a multi-query prefill kernel are not in this step. The smoke line is still `[1, 2, 3, 0]`.
+`GqaMask::Full` scores the whole cache (decode that already stored only the legal prefix). `GqaMask::Causal { query_pos }` drops key index `t > query_pos` before the dot, so those V slots are not read. `query_pos >= seq_len - 1` keeps every key. A zero count, a query-head count that is not a multiple of the KV-head count, or a bad buffer length returns `Err` and does not write. KV-cache allocation and a multi-query prefill kernel are not in this step. The smoke line is still `[1, 2, 3, 0]`.
+
+## SwiGLU
+
+`tensor_core::swiglu_bf16` is one token's Qwen2 MLP. Activations stay f32. `mlp.gate_proj.weight`, `mlp.up_proj.weight`, and `mlp.down_proj.weight` stay little-endian BF16 views and go through `gemv_bf16` (row-major `[out, in]`, f32 dot, left to right, multiply then add). `swiglu_f32` is the same graph on f32 weights. Qwen2.5-1.5B passes `HIDDEN_SIZE_QWEN25_1_5B` (1536) and `INTERMEDIATE_SIZE_QWEN25_1_5B` (8960): gate and up are `[8960, 1536]`, down is `[1536, 8960]`. Counts sit on `SwigluShape` so a test can shrink them.
+
+`gate = gemv(gate_proj, x)`, `up = gemv(up_proj, x)`, `h[i] = silu(gate[i]) * up[i]`, `y = gemv(down_proj, h)`. None of the three projections adds a bias (Qwen2.5 `mlp.*` has none). `silu_f32` is `z / (1 + expf(-z))` (libm `expf`, one division). That is llama.cpp `ggml_silu_f32`. It is not `z * (1 / (1 + expf(-z)))`; those differ by an ulp. The product is one multiply after SiLU returns, not `mul_add`. `gate`, `up`, and `h` are caller scratch of length `intermediate`. On success they hold those three vectors. A zero dimension or a bad buffer length returns `SwigluError::Shape` and does not write. The transformer block is not this step. The smoke line is still `[1, 2, 3, 0]`.
 
 ## Feature flags
 
