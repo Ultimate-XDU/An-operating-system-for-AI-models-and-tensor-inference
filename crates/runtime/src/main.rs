@@ -18,6 +18,10 @@
 //! `KvCache` / `BlockWorkspace` `max_seq` is `prompt.len() + steps`.
 //!
 //! Both of those decodes write `runs/<id>/run_fingerprint.json`.
+//!
+//! GEMV toggles (default keeps the knife-5 strided kernel):
+//! `MYOS_GEMV_PACK=1` packs each 32-row K-tile into column-major scratch.
+//! `MYOS_GEMV_PREFETCH=0` turns off software prefetch of the weight stream.
 mod fingerprint;
 
 use fingerprint::{
@@ -41,6 +45,25 @@ const SMOKE_STEPS: usize = 4;
 const SMOKE_PROMPT: u32 = 0;
 const USAGE: &str = "myos [--weights PATH] [--block-fixture] [--steps N] [--fingerprint-dir DIR] [--prompt-ids PATH] [--ref-ids PATH]";
 
+/// `MYOS_GEMV_PACK` / `MYOS_GEMV_PREFETCH`. Unset leaves the defaults
+/// (pack off, prefetch on).
+fn apply_gemv_toggles() {
+    if let Ok(v) = env::var("MYOS_GEMV_PACK") {
+        if v == "1" || v.eq_ignore_ascii_case("true") {
+            tensor_core::set_gemv_bf16_panel_pack(true);
+        } else if v == "0" || v.eq_ignore_ascii_case("false") {
+            tensor_core::set_gemv_bf16_panel_pack(false);
+        }
+    }
+    if let Ok(v) = env::var("MYOS_GEMV_PREFETCH") {
+        if v == "0" || v.eq_ignore_ascii_case("false") {
+            tensor_core::set_gemv_bf16_prefetch(false);
+        } else if v == "1" || v.eq_ignore_ascii_case("true") {
+            tensor_core::set_gemv_bf16_prefetch(true);
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = match parse_cli(env::args().skip(1)) {
         Ok(cli) => cli,
@@ -50,6 +73,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    apply_gemv_toggles();
 
     let reference = match load_ref_ids(cli.ref_ids.as_deref()) {
         Ok(ids) => ids,
@@ -511,6 +535,19 @@ mod tests {
         let tokens = smoke_decode(0, 4).unwrap();
         assert_eq!(tokens, vec![1, 2, 3, 0]);
         assert_eq!(smoke_decode(0, 2).unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn gemv_pack_and_prefetch_toggles_keep_block_fixture_tokens() {
+        let baseline = block_fixture_decode(SMOKE_PROMPT, 4).unwrap();
+        tensor_core::set_gemv_bf16_panel_pack(true);
+        let packed = block_fixture_decode(SMOKE_PROMPT, 4).unwrap();
+        tensor_core::set_gemv_bf16_panel_pack(false);
+        tensor_core::set_gemv_bf16_prefetch(false);
+        let no_prefetch = block_fixture_decode(SMOKE_PROMPT, 4).unwrap();
+        tensor_core::set_gemv_bf16_prefetch(true);
+        assert_eq!(packed, baseline);
+        assert_eq!(no_prefetch, baseline);
     }
 
     #[test]

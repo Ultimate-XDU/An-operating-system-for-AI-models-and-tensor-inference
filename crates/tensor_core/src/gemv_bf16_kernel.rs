@@ -8,8 +8,44 @@
 //! The add is `vaddps` after `vmulps`, not `vfmadd`.
 //!
 //! Callers have already checked `w.len() == y.len() * x.len() * 2`.
+//!
+//! Optional panel pack ([`set_gemv_bf16_panel_pack`]) copies each 32-row
+//! K-tile from row-major mmap order into a column-major BF16 scratch, then
+//! dots that scratch. The scratch is one tile, not a second copy of the
+//! matrix. Default is off: on the measured host the extra pass was slower
+//! than this strided kernel, and it did not reach 2×. Software prefetch of
+//! the next column group stays on unless [`set_gemv_bf16_prefetch`] is
+//! passed `false`.
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bf16_le_to_f32;
+
+/// Off by default. See the module docs.
+static PANEL_PACK: AtomicBool = AtomicBool::new(false);
+/// On by default. The prefetches are the ones already in the strided kernel.
+static PREFETCH: AtomicBool = AtomicBool::new(true);
+
+/// `true`: pack each 32-row tile into column-major scratch before the dot.
+///
+/// The hot path reads this once per GEMV. Safe to call before any GEMV; not
+/// meant to flip mid-call.
+pub fn set_gemv_bf16_panel_pack(enabled: bool) {
+    PANEL_PACK.store(enabled, Ordering::Relaxed);
+}
+
+/// `false` skips `_mm_prefetch` in the BF16 GEMV. Default is `true`.
+pub fn set_gemv_bf16_prefetch(enabled: bool) {
+    PREFETCH.store(enabled, Ordering::Relaxed);
+}
+
+fn panel_pack_enabled() -> bool {
+    PANEL_PACK.load(Ordering::Relaxed)
+}
+
+fn prefetch_enabled() -> bool {
+    PREFETCH.load(Ordering::Relaxed)
+}
 
 /// Dispatch. `w`, `x`, and `y` match a validated [`crate::gemv_bf16`] call
 /// with `k > 0`. `m == 0` writes nothing.
@@ -112,6 +148,10 @@ unsafe fn avx2_cpuid() -> bool {
 unsafe fn gemv_bf16_avx2(y: &mut [f32], w: &[u8], x: &[f32]) {
     use core::arch::x86_64::_mm256_storeu_ps;
 
+    if panel_pack_enabled() {
+        gemv_bf16_avx2_packed(y, w, x);
+        return;
+    }
     let m = y.len();
     let k = x.len();
     let row_bytes = k * 2;
@@ -502,11 +542,151 @@ unsafe fn dot_rows32_intrin(
 #[inline]
 unsafe fn prefetch_ahead(rows: [*const u8; 8], j: usize, k: usize) {
     use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-    if j + 64 < k {
+    if prefetch_enabled() && j + 64 < k {
         for r in 0..8 {
             _mm_prefetch(rows[r].add((j + 64) * 2) as *const i8, _MM_HINT_T0);
         }
     }
+}
+
+/// 32 rows × this many BF16 columns. 256 × 32 × 2 = 16 KiB, one L1 tile.
+#[cfg(target_arch = "x86_64")]
+const PACK_COLS: usize = 256;
+
+/// Column `j` is 32 little-endian BF16 (64 bytes). Group `g` of 8 rows is
+/// at byte `g * 16` inside the column, in [`cols_8x8`] order.
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(64))]
+struct ColPanel {
+    bytes: [u8; 32 * PACK_COLS * 2],
+}
+
+/// Pack path. Same row groups and the same left-to-right mul-then-add as
+/// [`gemv_bf16_avx2`]. The tile scratch dies with the call.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gemv_bf16_avx2_packed(y: &mut [f32], w: &[u8], x: &[f32]) {
+    use core::arch::x86_64::{_mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps};
+
+    let m = y.len();
+    let k = x.len();
+    let row_bytes = k * 2;
+    let w_ptr = w.as_ptr();
+    let x_ptr = x.as_ptr();
+    let y_ptr = y.as_mut_ptr();
+    let mut row = 0usize;
+    while row + 32 <= m {
+        let base = w_ptr.add(row * row_bytes);
+        let mut rows = [base; 32];
+        for r in 0..32 {
+            rows[r] = base.add(r * row_bytes);
+        }
+        let mut acc = [_mm256_setzero_ps(); 4];
+        let mut j = 0usize;
+        let k8 = k & !7;
+        while j < k8 {
+            let n = (k8 - j).min(PACK_COLS) & !7;
+            debug_assert!(n >= 8);
+            let mut panel = core::mem::MaybeUninit::<ColPanel>::uninit();
+            pack_cols32(&rows, j, n, k, panel.as_mut_ptr() as *mut u8);
+            acc = dot_packed_tile(panel.as_ptr() as *const u8, x_ptr.add(j), n, acc);
+            j += n;
+        }
+        if j < k {
+            let mut tmp = [0.0f32; 32];
+            _mm256_storeu_ps(tmp.as_mut_ptr(), acc[0]);
+            _mm256_storeu_ps(tmp.as_mut_ptr().add(8), acc[1]);
+            _mm256_storeu_ps(tmp.as_mut_ptr().add(16), acc[2]);
+            _mm256_storeu_ps(tmp.as_mut_ptr().add(24), acc[3]);
+            while j < k {
+                let xj = *x_ptr.add(j);
+                for r in 0..32 {
+                    tmp[r] += load_bf16(rows[r].add(j * 2)) * xj;
+                }
+                j += 1;
+            }
+            _mm256_storeu_ps(y_ptr.add(row), _mm256_loadu_ps(tmp.as_ptr()));
+            _mm256_storeu_ps(y_ptr.add(row + 8), _mm256_loadu_ps(tmp.as_ptr().add(8)));
+            _mm256_storeu_ps(y_ptr.add(row + 16), _mm256_loadu_ps(tmp.as_ptr().add(16)));
+            _mm256_storeu_ps(y_ptr.add(row + 24), _mm256_loadu_ps(tmp.as_ptr().add(24)));
+        } else {
+            _mm256_storeu_ps(y_ptr.add(row), acc[0]);
+            _mm256_storeu_ps(y_ptr.add(row + 8), acc[1]);
+            _mm256_storeu_ps(y_ptr.add(row + 16), acc[2]);
+            _mm256_storeu_ps(y_ptr.add(row + 24), acc[3]);
+        }
+        row += 32;
+    }
+    gemv_bf16_avx2_from16(y, w, x, row);
+}
+
+/// Transpose `n` columns (a multiple of 8) of 32 rows into `dst`.
+///
+/// `rows[r]` points at column 0. Output column `t` is 64 bytes at
+/// `dst + t * 64`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_cols32(rows: &[*const u8; 32], j0: usize, n: usize, k: usize, dst: *mut u8) {
+    use core::arch::x86_64::_mm_store_si128;
+
+    let mut panels = [[rows[0]; 8]; 4];
+    for g in 0..4 {
+        for i in 0..8 {
+            panels[g][i] = rows[g * 8 + i];
+        }
+    }
+    let mut t = 0usize;
+    while t < n {
+        if t % 32 == 0 {
+            prefetch_ahead(panels[0], j0 + t, k);
+            prefetch_ahead(panels[1], j0 + t, k);
+            prefetch_ahead(panels[2], j0 + t, k);
+            prefetch_ahead(panels[3], j0 + t, k);
+        }
+        for g in 0..4 {
+            let cols = cols_8x8(panels[g], j0 + t);
+            for u in 0..8 {
+                let p = dst.add((t + u) * 64 + g * 16);
+                _mm_store_si128(p as *mut _, cols[u]);
+            }
+        }
+        t += 8;
+    }
+}
+
+/// Continue the four YMM chains over a packed panel. Column order is `0..n`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_packed_tile(
+    col: *const u8,
+    x: *const f32,
+    n: usize,
+    mut acc: [core::arch::x86_64::__m256; 4],
+) -> [core::arch::x86_64::__m256; 4] {
+    use core::arch::x86_64::_mm_load_si128;
+
+    let mut j = 0usize;
+    while j + 4 <= n {
+        for t in 0..4 {
+            let p = col.add((j + t) * 64);
+            let xp = x.add(j + t);
+            acc[0] = madd8(acc[0], _mm_load_si128(p as *const _), xp);
+            acc[1] = madd8(acc[1], _mm_load_si128(p.add(16) as *const _), xp);
+            acc[2] = madd8(acc[2], _mm_load_si128(p.add(32) as *const _), xp);
+            acc[3] = madd8(acc[3], _mm_load_si128(p.add(48) as *const _), xp);
+        }
+        j += 4;
+    }
+    while j < n {
+        let p = col.add(j * 64);
+        let xp = x.add(j);
+        acc[0] = madd8(acc[0], _mm_load_si128(p as *const _), xp);
+        acc[1] = madd8(acc[1], _mm_load_si128(p.add(16) as *const _), xp);
+        acc[2] = madd8(acc[2], _mm_load_si128(p.add(32) as *const _), xp);
+        acc[3] = madd8(acc[3], _mm_load_si128(p.add(48) as *const _), xp);
+        j += 1;
+    }
+    acc
 }
 
 #[cfg(test)]
@@ -597,7 +777,24 @@ mod tests {
             let mut y_avx = vec![3.0f32; m];
             unsafe { gemv_bf16_avx2(&mut y_avx, w, x) };
             assert_same_bits(&y_avx, &y_naive);
+            // Column-major tile scratch. Same bits, including across K tiles.
+            let mut y_pack = vec![4.0f32; m];
+            unsafe { gemv_bf16_avx2_packed(&mut y_pack, w, x) };
+            assert_same_bits(&y_pack, &y_naive);
         }
+    }
+
+    #[test]
+    fn panel_pack_flag_matches_scalar_and_restores() {
+        let (w, x) = patterned(40, 100, 0x66);
+        let mut y_naive = vec![0.0f32; 40];
+        naive(&mut y_naive, &w, &x);
+        set_gemv_bf16_panel_pack(true);
+        let mut y = vec![1.0f32; 40];
+        gemv_bf16(&mut y, &w, &x, 40, 100).unwrap();
+        set_gemv_bf16_panel_pack(false);
+        set_gemv_bf16_prefetch(true);
+        assert_same_bits(&y, &y_naive);
     }
 
     fn le_bf16(value: f32) -> [u8; 2] {
@@ -852,12 +1049,31 @@ mod tests {
             assert_same_bits(&y_fast, &y_naive);
             #[cfg(target_arch = "x86_64")]
             assert_same_bits(&y_prev, &y_naive);
+            #[cfg(target_arch = "x86_64")]
+            let pack = if super::avx2_available() {
+                let mut y_pack = vec![0.0f32; m];
+                let pack = elapsed_secs(3, || unsafe {
+                    super::gemv_bf16_avx2_packed(&mut y_pack, &w, &x);
+                    std::hint::black_box(&y_pack);
+                });
+                assert_same_bits(&y_pack, &y_naive);
+                pack
+            } else {
+                fast
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let pack = fast;
             let speedup = slow / fast;
             let vs_prev = prev / fast;
             let macs = (m as f64) * (k as f64);
             eprintln!(
                 "gemv_bf16 {name} [{m}, {k}]: naive {slow:.6}s knife5a {prev:.6}s fast {fast:.6}s vs_naive {speedup:.2}x vs_knife5a {vs_prev:.2}x ({:.2} Gmac/s)",
                 macs / fast / 1e9
+            );
+            eprintln!(
+                "gemv_bf16 {name} pack [{m}, {k}]: {pack:.6}s vs_strided {:.2}x ({:.2} Gmac/s) — not the default",
+                fast / pack,
+                macs / pack / 1e9
             );
             // Floor, not the measured factor. This host's one-row loop is
             // already close to f32-add throughput. The printed line is the

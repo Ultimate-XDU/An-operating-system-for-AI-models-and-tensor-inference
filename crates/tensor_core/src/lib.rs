@@ -45,6 +45,7 @@ pub use bf16::{
     add_bf16_bias, bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32,
     Bf16OpError, ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
 };
+pub use gemv_bf16_kernel::{set_gemv_bf16_panel_pack, set_gemv_bf16_prefetch};
 pub use gqa::{
     attn_scale_f32, gqa_attn_f32, GqaError, GqaMask, GqaShape, GQA_Q_PER_KV_QWEN25_1_5B,
     NUM_ATTENTION_HEADS_QWEN25_1_5B, NUM_KV_HEADS_QWEN25_1_5B,
