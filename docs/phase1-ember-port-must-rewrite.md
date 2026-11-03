@@ -45,3 +45,12 @@ ember 的 `load_f32` 在加载期把 BF16/F16/F32 整表收成 `Vec<f32>`。MyOS
 - `myos_runtime` 默认烟雾仍是 `[1, 2, 3, 0]`。`--block-fixture` 另走一条进程内微型 BF16 夹具上的 greedy，不下载 1.5B。
 
 `QwenStub` 仍用 `StubCursor` 计数。烟雾行仍是 `[1, 2, 3, 0]`。
+
+## 刀④ 状态
+
+刀④已落地（真 SafeTensors 接到已有 block forward），仍服从上面三条。不新写算子。
+
+- `myos --weights PATH`（没有 `--block-fixture`）用已有 `SafeTensorsMmap` 映射文件，形状是 `BlockShape::qwen25_1_5b()`，然后走已有 `prefill` / `greedy_decode`。权重仍是 BF16 字节视图。不调用 `load_f32_tensor`，不在 runtime 里把整表收成 `Vec<f32>`。升精只在已有 `tensor_core` 算子内（NeoX、QKV bias、SwiGLU、串行核都不换）。
+- 默认无参数仍是 `[1, 2, 3, 0]`，不写指纹。`--block-fixture` 仍是进程内微型夹具 `[1, 1, 1, 1]`。两条路径都不下载 1.5B。`--weights` 与 `--block-fixture` 同时给出时，解码仍是夹具；文件只做 SafeTensors 解析，坏路径在夹具行之前退出。
+- 宿主写出 `runs/<id>/run_fingerprint.json`（权重跑 `s1-weights`，夹具跑 `s1-block-fixture`）。`quant_or_dtype=bf16`，`acc_path=bf16_w_fp32_acc`，`deterministic=true`，`device=cpu`，`threads=1`。`model_sha256` 与 `seed` 为 JSON null（不把布局文档里的 LFS oid 抄进指纹，也不假装有 RNG seed）。`scenario_id` 是占位 `S1`；`n_prompt` / `n_gen` 是这次进程的实际步数，不是协议的 128/128。这不是对 llama.cpp 的 exact 对比。
+- mmap、CLI、指纹留在 `myos_runtime`。`model_core` 仍是 no_std，依赖不变。没有 rayon、anyhow、tokenizers、onig。

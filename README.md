@@ -22,18 +22,23 @@ cargo test --workspace
 cargo run -p myos_runtime
 ```
 
-`cargo run -p myos_runtime` prints `MyOS Phase1 smoke decode (prompt=0): [1, 2, 3, 0]`.
+`cargo run -p myos_runtime` prints `MyOS Phase1 smoke decode (prompt=0): [1, 2, 3, 0]`. That path does not read a weight file and does not write a fingerprint. `--steps N` changes how many tokens that cycle emits (default 4).
 
-`--block-fixture` is a separate path (knife ③). It does not print that cycle line. It greedy-decodes a tiny in-process BF16 block and prints `MyOS Phase1 block fixture (prompt=0): [1, 1, 1, 1]`. It does not download Qwen.
+`--block-fixture` is a separate path (knife ③). It does not print that cycle line. It greedy-decodes a tiny in-process BF16 block and prints `MyOS Phase1 block fixture (prompt=0): [1, 1, 1, 1]`. It does not download Qwen. It writes `runs/s1-block-fixture/run_fingerprint.json`.
 
-Optional debug print of a SafeTensors file (tensor count and sorted names), then the same smoke line:
+`--weights PATH` (knife ④) maps that SafeTensors file and greedy-decodes it at `BlockShape::qwen25_1_5b` (28 layers, hidden 1536, vocab 151936). The prompt token id is 0. The default step count is 4. Success prints `MyOS Phase1 weights decode (prompt=0, steps=4): [...]` and writes `runs/s1-weights/run_fingerprint.json`. This binary does not download weights. A missing file, a file that is not SafeTensors, or a file whose tensors are not that BF16 layout exits before any decode line and does not fall through to the cycle.
 
 ```
-cargo run -p myos_runtime -- --weights path/to/file.safetensors
-MYOS_WEIGHTS=path/to/file.safetensors cargo run -p myos_runtime
+cargo run -p myos_runtime -- --weights path/to/model.safetensors
+cargo run -p myos_runtime -- --weights path/to/model.safetensors --steps 4
+MYOS_WEIGHTS=path/to/model.safetensors cargo run -p myos_runtime
 ```
 
-`--weights` wins when both are set. The smoke path does not load that file. A bad path exits before the smoke line.
+`--weights` wins over `MYOS_WEIGHTS` when both are set. `--block-fixture` still runs the in-process fixture when that flag is set. If a weights path is also set, the file is only checked as SafeTensors; its tensors are not the fixture. A bad path still exits before the fixture line.
+
+`--fingerprint-dir DIR` writes `DIR/run_fingerprint.json` instead of `runs/<id>/`. It needs `--weights` or `--block-fixture`.
+
+The fingerprint is host-only. It records the protocol §1.3 fields this process knows, plus `quant_or_dtype=bf16` and `acc_path=bf16_w_fp32_acc`. `model_sha256` and `seed` are JSON null (the file is not hashed, and greedy argmax has no RNG). `scenario_id` is the placeholder `S1`; `n_prompt` and `n_gen` are this process, not the protocol's 128/128. `commit` is git HEAD when a `.git` directory is visible from the working directory, otherwise null. The file is not a llama.cpp exact result. `runs/` is gitignored.
 
 ## SafeTensors loader
 
@@ -99,6 +104,10 @@ Each slot is `[kv_head, pos, head_dim]` with a `max_seq` stride. The layer packs
 
 `QwenStub` still counts tokens on `StubCursor`. `cargo run -p myos_runtime` is still `[1, 2, 3, 0]`. `--block-fixture` runs `block_fixture` (hidden 2, vocab 4, one layer, built in process) and prints `[1, 1, 1, 1]`. Unit tests build tiny BF16 tables in process; they do not download Qwen.
 
+## Weights file (knife ④)
+
+`cargo run -p myos_runtime -- --weights PATH` maps that file with `SafeTensorsMmap` and runs the same `prefill` / `greedy_decode` at `BlockShape::qwen25_1_5b`. The bytes stay a BF16 view (`quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc`). The host does not call `load_f32_tensor` on those tensors and does not build a `Vec<f32>` of the checkpoint. See the smoke section for the CLI line and `runs/<id>/run_fingerprint.json`. A few-hundred-byte SafeTensors copy of `block_fixture` is what CI decodes twice, at `fixture_shape`, to check that the mmap path is stable. The CLI itself still demands the 1.5B shape, so that miniature file is an error, not a successful weights line.
+
 ## Feature flags
 
 `weight_loader` is `no_std` + `alloc` by default. `tensor_core` and `model_core` depend on that default and do not enable host I/O.
@@ -108,7 +117,7 @@ Each slot is `[kv_head, pos, head_dim]` with a `max_seq` stride. The layer packs
 | (default) | `no_std` library builds | `SafeTensorsWeights::parse(&[u8])` over a caller-owned buffer. No OS, no mmap. |
 | `host` | non-test builds that open files (`myos_runtime` enables it) | `std` and `memmap2`. `SafeTensorsMmap::open(path)` maps a `.safetensors` file read-only. `parse()` borrows tensor payloads from the map; it does not copy them into a `Vec<u8>`. |
 
-`myos_runtime` enables `weight_loader`'s `host` feature so the debug flag above can open a file. Do not turn `host` on for a `no_std` target: it links `std`. `cargo test -p weight_loader` still compiles the mmap module for that crate's own tests; `--features host` is what dependents need outside tests.
+`myos_runtime` enables `weight_loader`'s `host` feature so `--weights` can map a SafeTensors file. `parse()` borrows tensor payloads from the map. Do not turn `host` on for a `no_std` target: it links `std`. `cargo test -p weight_loader` still compiles the mmap module for that crate's own tests; `--features host` is what dependents need outside tests. The fingerprint writer lives in the runtime binary, not in `model_core`.
 
 Tests generate a few-hundred-byte fixture at runtime (same `safetensors::serialize` path as the in-memory parser tests). Real `*.safetensors` weights stay gitignored.
 
