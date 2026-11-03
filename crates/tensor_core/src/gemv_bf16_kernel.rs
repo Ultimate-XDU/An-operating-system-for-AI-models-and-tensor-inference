@@ -2,11 +2,10 @@
 //!
 //! Several rows share one pass over `x`. Each row still does
 //! `acc += bf16_to_f32(w) * x[j]` for `j` from `0` to `k - 1` (multiply,
-//! then add; not FMA). On x86_64 with AVX2, groups of four rows sit in XMM
-//! lanes. A lane is only added to itself, in column order, so the bits
-//! match the one-row scalar loop. The tile is XMM on purpose: a VEX xmm
-//! op clears the upper half of that ymm, and a wider transpose spilled
-//! the accumulators.
+//! then add; not FMA). On x86_64 with AVX2, eight rows sit in one YMM and
+//! four of those accumulators stay live (32 rows). A lane is only added to
+//! itself, in column order, so the bits match the one-row scalar loop.
+//! The add is `vaddps` after `vmulps`, not `vfmadd`.
 //!
 //! Callers have already checked `w.len() == y.len() * x.len() * 2`.
 
@@ -103,14 +102,15 @@ unsafe fn avx2_cpuid() -> bool {
     leaf7.ebx & (1 << 5) != 0
 }
 
-/// Sixteen rows, then eight, then a scalar tail.
+/// Thirty-two rows, then sixteen, then eight, then a scalar tail.
 ///
-/// Each XMM holds four row accumulators. Columns are applied from `j = 0`
-/// upward, multiply then add, so each row matches the scalar chain.
+/// The 32-row kernel keeps four YMM accumulators (eight rows each). Columns
+/// still run left to right, multiply then add. XMM shuffles stay on
+/// `xmm0`–`xmm7` / `xmm12`–`xmm14` so they do not clobber those YMM accs.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn gemv_bf16_avx2(y: &mut [f32], w: &[u8], x: &[f32]) {
-    use core::arch::x86_64::_mm_storeu_ps;
+    use core::arch::x86_64::_mm256_storeu_ps;
 
     let m = y.len();
     let k = x.len();
@@ -119,6 +119,34 @@ unsafe fn gemv_bf16_avx2(y: &mut [f32], w: &[u8], x: &[f32]) {
     let x_ptr = x.as_ptr();
     let y_ptr = y.as_mut_ptr();
     let mut row = 0usize;
+    while row + 32 <= m {
+        let mut rows = [w_ptr; 32];
+        let base = w_ptr.add(row * row_bytes);
+        for r in 0..32 {
+            rows[r] = base.add(r * row_bytes);
+        }
+        let acc = dot_rows32_intrin(&rows, x_ptr, k);
+        _mm256_storeu_ps(y_ptr.add(row), acc[0]);
+        _mm256_storeu_ps(y_ptr.add(row + 8), acc[1]);
+        _mm256_storeu_ps(y_ptr.add(row + 16), acc[2]);
+        _mm256_storeu_ps(y_ptr.add(row + 24), acc[3]);
+        row += 32;
+    }
+    gemv_bf16_avx2_from16(y, w, x, row);
+}
+
+/// Knife-5a body: sixteen rows, then eight, then a scalar tail, from `row`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn gemv_bf16_avx2_from16(y: &mut [f32], w: &[u8], x: &[f32], mut row: usize) {
+    use core::arch::x86_64::_mm_storeu_ps;
+
+    let m = y.len();
+    let k = x.len();
+    let row_bytes = k * 2;
+    let w_ptr = w.as_ptr();
+    let x_ptr = x.as_ptr();
+    let y_ptr = y.as_mut_ptr();
     while row + 16 <= m {
         let p0 = panel_ptrs(w_ptr, row, row_bytes);
         let p1 = panel_ptrs(w_ptr, row + 8, row_bytes);
@@ -332,6 +360,142 @@ unsafe fn dot_rows16(
     )
 }
 
+/// Eight columns × eight rows. Column `t` lane `r` is row `r`, column `j+t`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn cols_8x8(rows: [*const u8; 8], j: usize) -> [core::arch::x86_64::__m128i; 8] {
+    use core::arch::x86_64::{
+        _mm_loadu_si128, _mm_unpackhi_epi16, _mm_unpackhi_epi32, _mm_unpackhi_epi64,
+        _mm_unpacklo_epi16, _mm_unpacklo_epi32, _mm_unpacklo_epi64,
+    };
+    let off = j * 2;
+    let r0 = _mm_loadu_si128(rows[0].add(off) as *const _);
+    let r1 = _mm_loadu_si128(rows[1].add(off) as *const _);
+    let r2 = _mm_loadu_si128(rows[2].add(off) as *const _);
+    let r3 = _mm_loadu_si128(rows[3].add(off) as *const _);
+    let r4 = _mm_loadu_si128(rows[4].add(off) as *const _);
+    let r5 = _mm_loadu_si128(rows[5].add(off) as *const _);
+    let r6 = _mm_loadu_si128(rows[6].add(off) as *const _);
+    let r7 = _mm_loadu_si128(rows[7].add(off) as *const _);
+    let a0 = _mm_unpacklo_epi16(r0, r1);
+    let a1 = _mm_unpackhi_epi16(r0, r1);
+    let a2 = _mm_unpacklo_epi16(r2, r3);
+    let a3 = _mm_unpackhi_epi16(r2, r3);
+    let a4 = _mm_unpacklo_epi16(r4, r5);
+    let a5 = _mm_unpackhi_epi16(r4, r5);
+    let a6 = _mm_unpacklo_epi16(r6, r7);
+    let a7 = _mm_unpackhi_epi16(r6, r7);
+    let b0 = _mm_unpacklo_epi32(a0, a2);
+    let b1 = _mm_unpackhi_epi32(a0, a2);
+    let b2 = _mm_unpacklo_epi32(a1, a3);
+    let b3 = _mm_unpackhi_epi32(a1, a3);
+    let b4 = _mm_unpacklo_epi32(a4, a6);
+    let b5 = _mm_unpackhi_epi32(a4, a6);
+    let b6 = _mm_unpacklo_epi32(a5, a7);
+    let b7 = _mm_unpackhi_epi32(a5, a7);
+    [
+        _mm_unpacklo_epi64(b0, b4),
+        _mm_unpackhi_epi64(b0, b4),
+        _mm_unpacklo_epi64(b1, b5),
+        _mm_unpackhi_epi64(b1, b5),
+        _mm_unpacklo_epi64(b2, b6),
+        _mm_unpackhi_epi64(b2, b6),
+        _mm_unpacklo_epi64(b3, b7),
+        _mm_unpackhi_epi64(b3, b7),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn madd8(
+    acc: core::arch::x86_64::__m256,
+    col: core::arch::x86_64::__m128i,
+    x: *const f32,
+) -> core::arch::x86_64::__m256 {
+    use core::arch::x86_64::{
+        _mm256_add_ps, _mm256_broadcast_ss, _mm256_castsi256_ps, _mm256_cvtepu16_epi32,
+        _mm256_mul_ps, _mm256_slli_epi32,
+    };
+    // Shift, not FMA: same bits as `u16 as u32 << 16`, then mul, then add.
+    let w = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(col), 16));
+    let xv = _mm256_broadcast_ss(&*x);
+    _mm256_add_ps(acc, _mm256_mul_ps(w, xv))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_rows32_intrin(
+    rows: &[*const u8; 32],
+    x: *const f32,
+    k: usize,
+) -> [core::arch::x86_64::__m256; 4] {
+    use core::arch::x86_64::{_mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps};
+
+    let mut a0 = _mm256_setzero_ps();
+    let mut a1 = _mm256_setzero_ps();
+    let mut a2 = _mm256_setzero_ps();
+    let mut a3 = _mm256_setzero_ps();
+    let p = |g: usize| {
+        let mut panel = [rows[0]; 8];
+        for i in 0..8 {
+            panel[i] = rows[g * 8 + i];
+        }
+        panel
+    };
+    let p0 = p(0);
+    let p1 = p(1);
+    let p2 = p(2);
+    let p3 = p(3);
+    let mut j = 0usize;
+    let k8 = k & !7;
+    while j < k8 {
+        if j % 32 == 0 {
+            prefetch_ahead(p0, j, k);
+            prefetch_ahead(p1, j, k);
+            prefetch_ahead(p2, j, k);
+            prefetch_ahead(p3, j, k);
+        }
+        let c0 = cols_8x8(p0, j);
+        let c1 = cols_8x8(p1, j);
+        for t in 0..8 {
+            let xp = x.add(j + t);
+            a0 = madd8(a0, c0[t], xp);
+            a1 = madd8(a1, c1[t], xp);
+        }
+        let c2 = cols_8x8(p2, j);
+        let c3 = cols_8x8(p3, j);
+        for t in 0..8 {
+            let xp = x.add(j + t);
+            a2 = madd8(a2, c2[t], xp);
+            a3 = madd8(a3, c3[t], xp);
+        }
+        j += 8;
+    }
+    if j == k {
+        return [a0, a1, a2, a3];
+    }
+    let mut tmp = [0.0f32; 32];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), a0);
+    _mm256_storeu_ps(tmp.as_mut_ptr().add(8), a1);
+    _mm256_storeu_ps(tmp.as_mut_ptr().add(16), a2);
+    _mm256_storeu_ps(tmp.as_mut_ptr().add(24), a3);
+    while j < k {
+        let xj = *x.add(j);
+        for r in 0..32 {
+            tmp[r] += load_bf16(rows[r].add(j * 2)) * xj;
+        }
+        j += 1;
+    }
+    [
+        _mm256_loadu_ps(tmp.as_ptr()),
+        _mm256_loadu_ps(tmp.as_ptr().add(8)),
+        _mm256_loadu_ps(tmp.as_ptr().add(16)),
+        _mm256_loadu_ps(tmp.as_ptr().add(24)),
+    ]
+}
+
 /// Pull each row's line 64 BF16 ahead of `j`. Rows sit `k * 2` bytes apart.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -465,15 +629,14 @@ mod tests {
         gemv_bf16(&mut y, &w, &x, 1, 8).unwrap();
         assert_eq!(y[0].to_bits(), 3.0f32.to_bits());
 
-        // Every row of a 16-row panel uses the same chain, including rows
-        // that land in the second XMM group.
-        let mut wide = Vec::with_capacity(16 * w.len());
-        for _ in 0..16 {
+        // 32 rows: one full YMM panel (four accumulators, eight lanes each).
+        let mut wide = Vec::with_capacity(32 * w.len());
+        for _ in 0..32 {
             wide.extend_from_slice(&w);
         }
-        let mut y16 = vec![0.0f32; 16];
-        gemv_bf16(&mut y16, &wide, &x, 16, 8).unwrap();
-        assert!(y16.iter().all(|v| v.to_bits() == 3.0f32.to_bits()));
+        let mut y32 = vec![0.0f32; 32];
+        gemv_bf16(&mut y32, &wide, &x, 32, 8).unwrap();
+        assert!(y32.iter().all(|v| v.to_bits() == 3.0f32.to_bits()));
     }
 
     #[test]
@@ -623,32 +786,82 @@ mod tests {
             (4096, HIDDEN_SIZE_QWEN25_1_5B, "lm_head_panel"),
             (HIDDEN_SIZE_QWEN25_1_5B, HIDDEN_SIZE_QWEN25_1_5B, "q_or_o"),
         ];
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Hot panel: 32×256 BF16 is 16 KiB, so this is the compute ceiling
+            // rather than the big-shape bandwidth ceiling.
+            let (m, k) = (32usize, 256usize);
+            let (w, x) = normal_panel(m, k, 7);
+            let mut y_fast = vec![0.0f32; m];
+            let mut y_prev = vec![0.0f32; m];
+            let mut y_naive = vec![0.0f32; m];
+            let reps = 4000usize;
+            let fast = elapsed_secs(3, || {
+                for _ in 0..reps {
+                    gemv_bf16(&mut y_fast, &w, &x, m, k).unwrap();
+                }
+                std::hint::black_box(&y_fast);
+            });
+            let prev = elapsed_secs(3, || unsafe {
+                for _ in 0..reps {
+                    super::gemv_bf16_avx2_from16(&mut y_prev, &w, &x, 0);
+                }
+                std::hint::black_box(&y_prev);
+            });
+            let slow = elapsed_secs(3, || {
+                for _ in 0..reps {
+                    naive(&mut y_naive, &w, &x);
+                }
+                std::hint::black_box(&y_naive);
+            });
+            let macs = (reps * m * k) as f64;
+            eprintln!(
+                "gemv_bf16 hot_32x256: naive {:.2} Gmac/s knife5a {:.2} fast {:.2} vs_naive {:.2}x vs_knife5a {:.2}x",
+                macs / slow / 1e9,
+                macs / prev / 1e9,
+                macs / fast / 1e9,
+                slow / fast,
+                prev / fast
+            );
+        }
         for (m, k, name) in shapes {
             // Normal magnitudes. Random bit patterns include BF16 subnormals,
             // and subnormal fp32 math is microcoded, so it does not measure
             // the decode path. Qwen weights are normal BF16.
             let (w, x) = normal_panel(m, k, 0x51);
             let mut y_fast = vec![0.0f32; m];
+            #[cfg(target_arch = "x86_64")]
+            let mut y_prev = vec![0.0f32; m];
             let mut y_naive = vec![0.0f32; m];
             let fast = elapsed_secs(3, || {
                 gemv_bf16(&mut y_fast, &w, &x, m, k).unwrap();
                 std::hint::black_box(&y_fast);
             });
+            // Knife 5a: the 16-row XMM kernel, still in this file as the tail.
+            #[cfg(target_arch = "x86_64")]
+            let prev = elapsed_secs(3, || unsafe {
+                super::gemv_bf16_avx2_from16(&mut y_prev, &w, &x, 0);
+                std::hint::black_box(&y_prev);
+            });
+            #[cfg(not(target_arch = "x86_64"))]
+            let prev = slow;
             let slow = elapsed_secs(3, || {
                 naive(&mut y_naive, &w, &x);
                 std::hint::black_box(&y_naive);
             });
             assert_same_bits(&y_fast, &y_naive);
+            #[cfg(target_arch = "x86_64")]
+            assert_same_bits(&y_prev, &y_naive);
             let speedup = slow / fast;
+            let vs_prev = prev / fast;
             let macs = (m as f64) * (k as f64);
             eprintln!(
-                "gemv_bf16 {name} [{m}, {k}]: naive {slow:.6}s fast {fast:.6}s speedup {speedup:.2}x ({:.2} Gmac/s)",
+                "gemv_bf16 {name} [{m}, {k}]: naive {slow:.6}s knife5a {prev:.6}s fast {fast:.6}s vs_naive {speedup:.2}x vs_knife5a {vs_prev:.2}x ({:.2} Gmac/s)",
                 macs / fast / 1e9
             );
             // Floor, not the measured factor. This host's one-row loop is
-            // already close to f32-add throughput, so the ratio sits around
-            // 3.5–5×. The printed line is the number to quote. A regression
-            // back to that one-row loop still fails.
+            // already close to f32-add throughput. The printed line is the
+            // number to quote. A regression back to that loop still fails.
             assert!(
                 speedup >= 2.5,
                 "{name} speedup {speedup:.2}x, want >= 2.5x versus the naive loop"
