@@ -26,19 +26,22 @@ cargo run -p myos_runtime
 
 `--block-fixture` is a separate path (knife ③). It does not print that cycle line. It greedy-decodes a tiny in-process BF16 block and prints `MyOS Phase1 block fixture (prompt=0): [1, 1, 1, 1]`. It does not download Qwen. It writes `runs/s1-block-fixture/run_fingerprint.json`.
 
-`--weights PATH` (knife ④) maps that SafeTensors file and greedy-decodes it at `BlockShape::qwen25_1_5b` (28 layers, hidden 1536, vocab 151936). The prompt token id is 0. The default step count is 4. Success prints `MyOS Phase1 weights decode (prompt=0, steps=4): [...]` and writes `runs/s1-weights/run_fingerprint.json`. This binary does not download weights. A missing file, a file that is not SafeTensors, or a file whose tensors are not that BF16 layout exits before any decode line and does not fall through to the cycle.
+`--weights PATH` (knife ④) maps that SafeTensors file and greedy-decodes it at `BlockShape::qwen25_1_5b` (28 layers, hidden 1536, vocab 151936). Without `--prompt-ids` the prompt is the single token id 0. The default step count is 4. Success prints `MyOS Phase1 weights decode (prompt=0, steps=4): [...]` and writes `runs/s1-weights/run_fingerprint.json`. This binary does not download weights. A missing file, a file that is not SafeTensors, or a file whose tensors are not that BF16 layout exits before any decode line and does not fall through to the cycle.
+
+`--prompt-ids PATH` (with `--weights`) reads whitespace-separated `u32` prompt ids, prefills all of them, then greedy-decodes `--steps` tokens. `max_seq` is `prompt.len() + steps`. Protocol S1 is `--steps 128` on a 128-id file. The fingerprint records that `n_prompt` and `n_gen`, and the run dir also gets `token_ids.txt` (space-separated generated ids). An empty file is an error. `--ref-ids PATH` compares those generated ids and prints `CORRECT: PASS` or `CORRECT: FAIL first_diff@i: got=X ref=Y` (length mismatch is its own FAIL line). A mismatch still exits 0.
 
 ```
 cargo run -p myos_runtime -- --weights path/to/model.safetensors
 cargo run -p myos_runtime -- --weights path/to/model.safetensors --steps 4
 MYOS_WEIGHTS=path/to/model.safetensors cargo run -p myos_runtime
+cargo run -p myos_runtime -- --weights path/to/model.safetensors --prompt-ids arena/prompts/s1_prompt.token_ids.txt --steps 128 --ref-ids runs/s1-llamacpp-bf16-b11960/token_ids.txt --fingerprint-dir runs/e2-myos-s1
 ```
 
 `--weights` wins over `MYOS_WEIGHTS` when both are set. `--block-fixture` still runs the in-process fixture when that flag is set. If a weights path is also set, the file is only checked as SafeTensors; its tensors are not the fixture. A bad path still exits before the fixture line.
 
 `--fingerprint-dir DIR` writes `DIR/run_fingerprint.json` instead of `runs/<id>/`. It needs `--weights` or `--block-fixture`.
 
-The fingerprint is host-only. It records the protocol §1.3 fields this process knows, plus `quant_or_dtype=bf16` and `acc_path=bf16_w_fp32_acc`. `model_sha256` and `seed` are JSON null (the file is not hashed, and greedy argmax has no RNG). `scenario_id` is the placeholder `S1`; `n_prompt` and `n_gen` are this process, not the protocol's 128/128. `commit` is git HEAD when a `.git` directory is visible from the working directory, otherwise null. The file is not a llama.cpp exact result. `runs/` is gitignored.
+The fingerprint is host-only. It records the protocol §1.3 fields this process knows, plus `quant_or_dtype=bf16` and `acc_path=bf16_w_fp32_acc`. `model_sha256` and `seed` are JSON null (the file is not hashed, and greedy argmax has no RNG). `scenario_id` is `S1`. Without `--prompt-ids`, `n_prompt` is 1. With `--prompt-ids`, `n_prompt` is the file length, `n_gen` is `--steps`, and the notes say this is the E2 multi-token path. `prompt_token` is the first prompt id. `commit` is git HEAD when a `.git` directory is visible from the working directory, otherwise null. The fingerprint file is not itself a llama.cpp exact result; `--ref-ids` prints the CORRECT gate. `runs/` is gitignored.
 
 ## SafeTensors loader
 
