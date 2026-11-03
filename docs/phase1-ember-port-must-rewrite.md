@@ -27,3 +27,13 @@ ember 的 `load_f32` 在加载期把 BF16/F16/F32 整表收成 `Vec<f32>`。MyOS
 > no_std：控制流/映射进 model_core；mmap/CLI/tokenizers 不进 core；勿把 anyhow/rayon/tokenizers/onig 加进 core。
 
 键名在 `model_core::qwen25_layout`，借用在 `model_core::qwen25_bf16`。`model_core` 库依赖仍只有 `tensor_core` 与 `weight_loader`（默认无 `host`）。mmap 留在 `weight_loader` 的 `host` feature，由 `myos_runtime` 打开。单测里的微型 SafeTensors 夹具是 `model_core` 的 dev-dependency，不进入库依赖。
+
+## 刀② 状态
+
+刀②已落地（KV cache + 一层 attention 接线），仍服从上面三条。
+
+- `model_core::KvCache`：每层 K/V。Qwen2.5-1.5B 为 28 层、2 个 KV 头、head dim 128。形状在 `KvShape` 上，单测可缩小。同一 token 的每一层都写在当前 cursor，调用方在该 token 结束后 `advance` 一次。`attention_layer` 自己不 `advance`。控制流参考 ember `src/attention.rs` `KvCache` 与 `src/model.rs` `Model::new_cache`（MIT, Copyright (c) 2026 Ali Zulfiqar）。槽布局是 `[kv_head, pos, head_dim]`，打成 `[kv_head, seq, head_dim]` 后交给已有的 `gqa_attn_f32`（`e / sum`）。
+- `model_core::attention_layer`：经 `qwen25_bf16` 借 q/k/v/o 权重和 q/k/v bias（BF16 字节，形状可缩小）。`gemv_bf16`，再 `tensor_core::add_bf16_bias`（升精在算子内），Q/K 走 `rope_f32_inplace`（NeoX），V 不旋转，写入 cache，`gqa_attn_f32`，`o_proj` 无 bias，残差相加。不做 RMSNorm，不做 SwiGLU，不循环 28 层。
+- 未做，留给刀③：整块 forward、prefill/decode 循环。
+
+`QwenStub` 仍用 `StubCursor` 计数。烟雾行仍是 `[1, 2, 3, 0]`。

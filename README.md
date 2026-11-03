@@ -49,6 +49,8 @@ Phase1 main-track weights stay BF16 byte views. `tensor_core::gemv_bf16` is a ro
 
 Fingerprint intent, hash later: `quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc`.
 
+`tensor_core::add_bf16_bias` adds one little-endian BF16 vector onto an f32 vector after a projection has finished (`y[i] +=` the promoted element, one lane at a time). Qwen2.5 Q/K/V biases use it. `o_proj` and the MLP have no bias.
+
 `gemv_f32` and the `cycle_fixture` smoke stay on the f32 fixture. `cargo run -p myos_runtime` is still `[1, 2, 3, 0]`. Unit tests build tiny BF16 tables in process; they do not download Qwen.
 
 ## RMSNorm
@@ -67,17 +69,27 @@ Pairing is NeoX / half-rotate, the same layout as HF Qwen2 `rotate_half` and lla
 
 ## GQA attention
 
-`tensor_core::gqa_attn_f32` is one query position against cached K and V. Activations stay f32 (Q, K, V, scores, probabilities, output). There is no weight byte view: Q/K/V projections stay on `gemv_bf16` later. Counts sit on `GqaShape`. Qwen2.5-1.5B passes `NUM_ATTENTION_HEADS_QWEN25_1_5B` (12), `NUM_KV_HEADS_QWEN25_1_5B` (2), and `HEAD_DIM_QWEN25_1_5B` (128), so `GQA_Q_PER_KV_QWEN25_1_5B` is 6. Query head `h` reads KV head `h / 6` (HF `repeat_kv`, contiguous groups).
+`tensor_core::gqa_attn_f32` is one query position against cached K and V. Activations stay f32 (Q, K, V, scores, probabilities, output). There is no weight byte view: Q/K/V projections are `gemv_bf16` in `model_core::attention_layer`. Counts sit on `GqaShape`. Qwen2.5-1.5B passes `NUM_ATTENTION_HEADS_QWEN25_1_5B` (12), `NUM_KV_HEADS_QWEN25_1_5B` (2), and `HEAD_DIM_QWEN25_1_5B` (128), so `GQA_Q_PER_KV_QWEN25_1_5B` is 6. Query head `h` reads KV head `h / 6` (HF `repeat_kv`, contiguous groups).
 
 Layout, no batch axis: Q and Y are `[num_q_heads, head_dim]`. K and V are `[num_kv_heads, seq_len, head_dim]`. `scale = 1 / sqrtf(head_dim)` once (`attn_scale_f32`), then each score is `dot * scale` after a left-to-right dot (multiply, then add; not `mul_add`). Softmax is one thread over the visible keys: max starts at key 0 (`>`), `expf(score - max)`, left-to-right sum, then `e / sum` (division, not a reciprocal multiply). The value mix is the same left-to-right order. `probs` is scratch of length `seq_len`; on success it holds the last query head.
 
-`GqaMask::Full` scores the whole cache (decode that already stored only the legal prefix). `GqaMask::Causal { query_pos }` drops key index `t > query_pos` before the dot, so those V slots are not read. `query_pos >= seq_len - 1` keeps every key. A zero count, a query-head count that is not a multiple of the KV-head count, or a bad buffer length returns `Err` and does not write. KV-cache allocation and a multi-query prefill kernel are not in this step. The smoke line is still `[1, 2, 3, 0]`.
+`GqaMask::Full` scores the whole cache (decode that already stored only the legal prefix). `GqaMask::Causal { query_pos }` drops key index `t > query_pos` before the dot, so those V slots are not read. `query_pos >= seq_len - 1` keeps every key. A zero count, a query-head count that is not a multiple of the KV-head count, or a bad buffer length returns `Err` and does not write. A multi-query prefill kernel is not in this step. Per-layer KV allocation for that prefix is `model_core::KvCache` (below). The smoke line is still `[1, 2, 3, 0]`.
 
 ## SwiGLU
 
 `tensor_core::swiglu_bf16` is one token's Qwen2 MLP. Activations stay f32. `mlp.gate_proj.weight`, `mlp.up_proj.weight`, and `mlp.down_proj.weight` stay little-endian BF16 views and go through `gemv_bf16` (row-major `[out, in]`, f32 dot, left to right, multiply then add). `swiglu_f32` is the same graph on f32 weights. Qwen2.5-1.5B passes `HIDDEN_SIZE_QWEN25_1_5B` (1536) and `INTERMEDIATE_SIZE_QWEN25_1_5B` (8960): gate and up are `[8960, 1536]`, down is `[1536, 8960]`. Counts sit on `SwigluShape` so a test can shrink them.
 
 `gate = gemv(gate_proj, x)`, `up = gemv(up_proj, x)`, `h[i] = silu(gate[i]) * up[i]`, `y = gemv(down_proj, h)`. None of the three projections adds a bias (Qwen2.5 `mlp.*` has none). `silu_f32` is `z / (1 + expf(-z))` (libm `expf`, one division). That is llama.cpp `ggml_silu_f32`. It is not `z * (1 / (1 + expf(-z)))`; those differ by an ulp. The product is one multiply after SiLU returns, not `mul_add`. `gate`, `up`, and `h` are caller scratch of length `intermediate`. On success they hold those three vectors. A zero dimension or a bad buffer length returns `SwigluError::Shape` and does not write. The transformer block is not this step. The smoke line is still `[1, 2, 3, 0]`.
+
+## KV cache and attention wiring
+
+Knife ② is one attention layer. `model_core::KvCache` stores K and V for every layer. Qwen2.5-1.5B is 28 layers, 2 KV heads, head dim 128 (`KvShape::qwen25_1_5b`). Counts sit on `KvShape` so a test can shrink them. Every layer `store`s the current token at the same cursor. The caller `advance`s once after that token. `attention_layer` stores and does not advance. That cursor is ember's `KvCache` (MIT, Copyright (c) 2026 Ali Zulfiqar, `src/attention.rs`, allocated from `Model::new_cache` in `src/model.rs`).
+
+Each slot is `[kv_head, pos, head_dim]` with a `max_seq` stride. The layer packs the committed prefix plus the token just projected into `[kv_head, seq, head_dim]` and calls `gqa_attn_f32` with `GqaMask::Full`. Scores stay in that op (`e / sum`).
+
+`attention_layer` borrows `q/k/v/o` weights and the `q/k/v` biases through `qwen25_bf16` (little-endian BF16 views). Shapes come from `AttnShape`, so a fixture can be smaller than 1536. `gemv_bf16` writes each projection, then `add_bf16_bias` adds the Q/K/V bias in f32. `o_proj` has no bias. Q and K go through `rope_f32_inplace` (NeoX, one position, every head). V is not rotated. The output GEMV is added onto `residual`. `proj_in` is the QKV input. This step does not RMSNorm and does not run SwiGLU. Passing the same values for `proj_in` and the residual skips the norm. The full block — input norm, every layer, SwiGLU, prefill/decode — is knife ③.
+
+`QwenStub` still counts tokens on `StubCursor`. `cargo run -p myos_runtime` is still `[1, 2, 3, 0]`. Unit tests build tiny BF16 tables in process; they do not download Qwen.
 
 ## Feature flags
 

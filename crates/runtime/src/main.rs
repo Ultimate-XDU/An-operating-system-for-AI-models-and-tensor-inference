@@ -3,7 +3,7 @@
 //! `--weights PATH` (or `MYOS_WEIGHTS`) maps a SafeTensors file and prints its
 //! tensor count and names. That path is debug-only: the cycle smoke below
 //! still loads `cycle_fixture`, not the file.
-use model_core::{cycle_fixture, greedy_token, KvCache, MinimalistModel, ModelError, QwenStub};
+use model_core::{cycle_fixture, greedy_token, MinimalistModel, ModelError, QwenStub, StubCursor};
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
@@ -101,7 +101,7 @@ fn print_weight_names(path: &Path) -> Result<(), WeightFileError> {
 fn smoke_decode(prompt: u32, steps: usize) -> Result<Vec<u32>, ModelError> {
     let weights = cycle_fixture(SMOKE_VOCAB)?;
     let mut model = QwenStub::from_weights(&weights)?;
-    let mut kv = KvCache::default();
+    let mut kv = StubCursor::default();
     let mut token = prompt;
     let mut decoded = Vec::with_capacity(steps);
     for pos in 0..steps {
