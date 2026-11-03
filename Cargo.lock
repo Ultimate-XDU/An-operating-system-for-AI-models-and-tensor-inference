@@ -64,6 +64,7 @@ dependencies = [
 name = "model_core"
 version = "0.1.0"
 dependencies = [
+ "safetensors",
  "tensor_core",
  "weight_loader",
 ]

@@ -7,3 +7,7 @@ description = "ModelCore: type-safe model trait"
 [dependencies]
 tensor_core = { path = "../tensor_core" }
 weight_loader = { path = "../weight_loader" }
+
+[dev-dependencies]
+# Tests build a few-dozen-byte SafeTensors fixture. Not a library dependency.
+safetensors = { version = "0.8", default-features = false }

@@ -3,7 +3,8 @@
 //! [`MmapWeights`] is the in-memory f32 fixture behind the cycle smoke path.
 //! [`SafeTensorsWeights`] parses a SafeTensors byte buffer with the official
 //! `safetensors` crate (`std` feature off) and returns `&[u8]` views into that
-//! buffer. GGUF stays out of this crate for now.
+//! buffer. [`bf16_view`] borrows a BF16 payload from that buffer and does not
+//! decode it. GGUF stays out of this crate for now.
 //!
 //! The default build is `no_std` + `alloc`. Feature `host` (and this crate's
 //! own tests) add `SafeTensorsMmap`, which maps a `.safetensors` file with
@@ -29,8 +30,8 @@ use core::fmt;
 /// Element type stored in a tensor blob.
 ///
 /// `F16` and `BF16` are SafeTensors storage tags. [`load_f32_tensor`] still
-/// accepts only [`DType::F32`]; this crate does not convert low-precision
-/// payloads to f32.
+/// accepts only [`DType::F32`]. [`bf16_view`] borrows a BF16 payload and does
+/// not convert it to f32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
@@ -80,13 +81,44 @@ pub enum WeightError {
     UnsupportedDType,
 }
 
+/// Borrowed little-endian BF16 payload.
+///
+/// `bytes` points into the caller-owned buffer or mmap. `shape` points at the
+/// loader index. Neither is a decoded `Vec<f32>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bf16View<'a> {
+    pub shape: &'a [usize],
+    pub bytes: &'a [u8],
+}
+
+/// Borrow the BF16 tensor named `name`.
+///
+/// The dtype must be [`DType::BF16`] and the byte length must be
+/// `2 * numel(shape)`. This does not decode elements and does not allocate
+/// a payload copy. [`load_f32_tensor`] still rejects this dtype.
+pub fn bf16_view<'a>(map: &'a impl WeightMap, name: &str) -> Result<Bf16View<'a>, WeightError> {
+    let info = map.tensor_info(name)?;
+    if info.dtype != DType::BF16 {
+        return Err(WeightError::DTypeMismatch);
+    }
+    let nbytes = info.nbytes().ok_or(WeightError::LengthMismatch)?;
+    let bytes = map.tensor_bytes(name)?;
+    if bytes.len() != nbytes {
+        return Err(WeightError::LengthMismatch);
+    }
+    Ok(Bf16View {
+        shape: info.shape.as_slice(),
+        bytes,
+    })
+}
+
 impl fmt::Display for WeightError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WeightError::NotFound => write!(f, "tensor not found"),
             WeightError::Duplicate => write!(f, "tensor name already registered"),
             WeightError::EmptyName => write!(f, "tensor name is empty"),
-            WeightError::DTypeMismatch => write!(f, "tensor dtype is not f32"),
+            WeightError::DTypeMismatch => write!(f, "tensor dtype does not match"),
             WeightError::LengthMismatch => write!(f, "tensor byte length does not match shape"),
             WeightError::Parse => write!(f, "weight buffer could not be parsed"),
             WeightError::UnsupportedDType => write!(f, "tensor dtype is not supported"),
@@ -123,8 +155,10 @@ struct Entry {
 /// Owned byte blob plus a name index.
 ///
 /// The buffer is the P0 stand-in for an mmap: callers borrow tensor bytes, they do not clone them.
-/// `insert_f32` writes native-endian f32 bytes. This is an in-memory fixture format, not SafeTensors.
-/// A real file map is `SafeTensorsMmap` when feature `host` is enabled.
+/// `insert_f32` writes native-endian f32 bytes. `insert_bf16` stores the given
+/// little-endian BF16 bytes and does not decode them. This is an in-memory
+/// fixture format, not SafeTensors. A real file map is `SafeTensorsMmap` when
+/// feature `host` is enabled.
 #[derive(Debug, Default)]
 pub struct MmapWeights {
     buf: Vec<u8>,
@@ -162,6 +196,53 @@ impl MmapWeights {
         for value in data {
             self.buf.extend_from_slice(&value.to_ne_bytes());
         }
+        self.index.insert(
+            String::from(name),
+            Entry {
+                info,
+                offset,
+                len: nbytes,
+            },
+        );
+        Ok(())
+    }
+
+    /// Store a little-endian BF16 blob.
+    ///
+    /// `data` is copied into the fixture buffer once, as raw bytes. Callers
+    /// then borrow it. This does not expand BF16 to f32.
+    pub fn insert_bf16(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+        data: &[u8],
+    ) -> Result<(), WeightError> {
+        self.insert_bytes(name, DType::BF16, shape, data)
+    }
+
+    fn insert_bytes(
+        &mut self,
+        name: &str,
+        dtype: DType,
+        shape: &[usize],
+        bytes: &[u8],
+    ) -> Result<(), WeightError> {
+        if name.is_empty() {
+            return Err(WeightError::EmptyName);
+        }
+        if self.index.contains_key(name) {
+            return Err(WeightError::Duplicate);
+        }
+        let info = TensorInfo {
+            shape: shape.to_vec(),
+            dtype,
+        };
+        let nbytes = info.nbytes().ok_or(WeightError::LengthMismatch)?;
+        if nbytes != bytes.len() {
+            return Err(WeightError::LengthMismatch);
+        }
+        let offset = self.buf.len();
+        self.buf.extend_from_slice(bytes);
         self.index.insert(
             String::from(name),
             Entry {
@@ -256,6 +337,34 @@ mod tests {
         );
         assert_eq!(
             weights.insert_f32("bad", &[2], &[1.0]),
+            Err(WeightError::LengthMismatch)
+        );
+    }
+
+    #[test]
+    fn bf16_view_borrows_bytes_and_rejects_f32() {
+        let mut weights = MmapWeights::new();
+        // BF16 1.0 is 0x3F80, little-endian. Second element is not decoded here.
+        let payload = [0x80, 0x3F, 0x00, 0xC0];
+        weights.insert_bf16("row", &[1, 2], &payload).unwrap();
+        let view = bf16_view(&weights, "row").unwrap();
+        assert_eq!(view.shape, &[1, 2]);
+        assert_eq!(view.bytes, &payload);
+        assert_eq!(
+            view.bytes.as_ptr(),
+            weights.tensor_bytes("row").unwrap().as_ptr()
+        );
+        assert_eq!(view.bytes.len(), 4);
+        assert_eq!(
+            load_f32_tensor(&weights, "row"),
+            Err(WeightError::DTypeMismatch)
+        );
+
+        weights.insert_f32("f32", &[1], &[1.0]).unwrap();
+        assert_eq!(bf16_view(&weights, "f32"), Err(WeightError::DTypeMismatch));
+        assert_eq!(bf16_view(&weights, "missing"), Err(WeightError::NotFound));
+        assert_eq!(
+            weights.insert_bf16("short", &[2], &[0x80, 0x3F]),
             Err(WeightError::LengthMismatch)
         );
     }
