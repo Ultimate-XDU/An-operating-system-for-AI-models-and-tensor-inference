@@ -32,9 +32,12 @@
 //! are the serial dot, the f32 scale, and the serial max / `expf` / sum / divide.
 //! SwiGLU stays on that path too: serial GEMV, `expf` inside SiLU, the
 //! division form of SiLU, and a left-to-right multiply. No second dtype.
+//! [`gemv_bf16`] may walk several rows in one pass. Each row is still one
+//! left-to-right f32 chain (`acc += w * x`, not a fused multiply-add).
 #![cfg_attr(not(test), no_std)]
 
 mod bf16;
+mod gemv_bf16_kernel;
 mod gqa;
 mod rope;
 mod swiglu;
