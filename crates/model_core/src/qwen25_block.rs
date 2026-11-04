@@ -11,7 +11,7 @@
 //!
 //! Weights stay little-endian BF16 views from [`crate::qwen25_bf16`]. Promotion
 //! stays inside `tensor_core` (`quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc`).
-//! [`crate::attention_layer`] still owns QKV bias, NeoX RoPE, `gqa_attn_f32`
+//! [`crate::attention_layer`] still owns QKV bias, NeoX RoPE, `gqa_attn_f32_strided`
 //! (`e / sum`), and the `o_proj` residual. This module does not load a table
 //! with `load_f32_tensor`, does not use rayon, and does not look up `lm_head`.
 //!
@@ -28,7 +28,7 @@ use core::fmt;
 
 use tensor_core::{
     add_bf16_bias, embed_gather_bf16, gemm_bf16, gemm_bf16_scratch_elems, gemv_bf16,
-    gemv_bf16_threads, gqa_attn_f32, rmsnorm_bf16_weight, rope_f32_inplace, swiglu_bf16,
+    gemv_bf16_threads, gqa_attn_f32_strided, rmsnorm_bf16_weight, rope_f32_inplace, swiglu_bf16,
     swiglu_mul_f32, Bf16OpError, GqaMask, GqaShape, SwigluShape, RMS_NORM_EPS_QWEN25,
 };
 use weight_loader::{MmapWeights, WeightMap};
@@ -308,7 +308,8 @@ pub fn forward_token<'a>(
 /// This is not [`forward_token`] in a loop. One layer projects Q, K, V, the
 /// output, and the SwiGLU matrices for the whole chunk ([`gemm_bf16`]),
 /// writes that layer's K and V, then scores each query with
-/// [`gqa_attn_f32`] and [`GqaMask::Causal`]. Each `(token, row)` dot is still
+/// [`gqa_attn_f32_strided`] and [`GqaMask::Causal`] on the cache stride.
+/// Each `(token, row)` dot is still
 /// `j = 0..k-1`, multiply then add, so the chunk matches a serial
 /// [`forward_token`] on the success path: same KV slots, and the same logits
 /// for the last prompt id.
@@ -432,8 +433,6 @@ pub fn prefill<'a>(
         attend_chunk(
             &mut buf.att,
             &buf.q,
-            &mut buf.pack_k,
-            &mut buf.pack_v,
             &mut buf.probs,
             cache,
             layer,
@@ -553,8 +552,6 @@ struct PrefillBuf {
     gate: Vec<f32>,
     up: Vec<f32>,
     act: Vec<f32>,
-    pack_k: Vec<f32>,
-    pack_v: Vec<f32>,
     probs: Vec<f32>,
     gemm: Vec<f32>,
 }
@@ -571,12 +568,6 @@ impl PrefillBuf {
         let k_max = hidden.max(q_dim).max(shape.intermediate);
         let gemm_len =
             gemm_bf16_scratch_elems(n, k_max, gemv_bf16_threads()).ok_or(BlockError::Shape)?;
-        let pack = shape
-            .attn
-            .num_kv_heads
-            .checked_mul(seq)
-            .and_then(|v| v.checked_mul(shape.attn.head_dim))
-            .ok_or(BlockError::Shape)?;
         Ok(Self {
             x: zeros(n.checked_mul(hidden).ok_or(BlockError::Shape)?),
             normed: zeros(n.checked_mul(hidden).ok_or(BlockError::Shape)?),
@@ -588,8 +579,6 @@ impl PrefillBuf {
             gate: zeros(n.checked_mul(shape.intermediate).ok_or(BlockError::Shape)?),
             up: zeros(n.checked_mul(shape.intermediate).ok_or(BlockError::Shape)?),
             act: zeros(n.checked_mul(shape.intermediate).ok_or(BlockError::Shape)?),
-            pack_k: zeros(pack),
-            pack_v: zeros(pack),
             probs: zeros(seq),
             gemm: zeros(gemm_len),
         })
@@ -714,8 +703,6 @@ fn bias_rope_store(
 fn attend_chunk(
     att: &mut [f32],
     q: &[f32],
-    pack_k: &mut [f32],
-    pack_v: &mut [f32],
     probs: &mut [f32],
     cache: &KvCache,
     layer: usize,
@@ -725,22 +712,18 @@ fn attend_chunk(
     shape: BlockShape,
     q_dim: usize,
 ) -> Result<(), BlockError> {
-    cache
-        .pack_prefix(layer, end, pack_k, pack_v)
-        .map_err(BlockError::Cache)?;
-    let packed = shape
-        .attn
-        .num_kv_heads
-        .checked_mul(end)
-        .and_then(|v| v.checked_mul(shape.attn.head_dim))
-        .ok_or(BlockError::Shape)?;
+    let layer_k = cache.layer_keys(layer).map_err(BlockError::Cache)?;
+    let layer_v = cache.layer_values(layer).map_err(BlockError::Cache)?;
+    let stride = cache.max_seq();
     for i in 0..n {
         let s = i * q_dim;
-        gqa_attn_f32(
+        gqa_attn_f32_strided(
             &mut att[s..s + q_dim],
             &q[s..s + q_dim],
-            &pack_k[..packed],
-            &pack_v[..packed],
+            layer_k,
+            layer_v,
+            None,
+            None,
             &mut probs[..end],
             GqaShape {
                 num_q_heads: shape.attn.num_q_heads,
@@ -751,6 +734,7 @@ fn attend_chunk(
             GqaMask::Causal {
                 query_pos: start + i,
             },
+            stride,
         )
         .map_err(|_| BlockError::Shape)?;
     }

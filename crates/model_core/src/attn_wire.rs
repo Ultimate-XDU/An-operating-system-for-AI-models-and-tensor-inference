@@ -14,7 +14,8 @@
 //!
 //! Numeric work stays in `tensor_core`: [`tensor_core::gemv_bf16`],
 //! [`tensor_core::add_bf16_bias`], [`tensor_core::rope_f32_inplace`] (NeoX),
-//! and [`tensor_core::gqa_attn_f32`] (`e / sum` softmax). Weights stay
+//! and [`tensor_core::gqa_attn_f32_strided`] (`e / sum` softmax, cache
+//! stride, no prefix pack). Weights stay
 //! little-endian BF16 views from [`crate::qwen25_bf16`]. Q/K/V have bias.
 //! `o_proj` does not.
 
@@ -22,7 +23,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use tensor_core::{
-    add_bf16_bias, gemv_bf16, gqa_attn_f32, rope_f32_inplace, GqaMask, GqaShape, ROPE_THETA_QWEN25,
+    add_bf16_bias, gemv_bf16, gqa_attn_f32_strided, rope_f32_inplace, GqaMask, GqaShape,
+    ROPE_THETA_QWEN25,
 };
 
 use crate::kv_cache::{KvCache, KvError};
@@ -75,8 +77,6 @@ pub struct AttnWorkspace {
     att: Vec<f32>,
     proj: Vec<f32>,
     probs: Vec<f32>,
-    pack_k: Vec<f32>,
-    pack_v: Vec<f32>,
 }
 
 impl AttnWorkspace {
@@ -85,11 +85,6 @@ impl AttnWorkspace {
         if max_seq == 0 {
             return Err(AttnError::Shape);
         }
-        let pack = dims
-            .kv_heads
-            .checked_mul(max_seq)
-            .and_then(|n| n.checked_mul(dims.head_dim))
-            .ok_or(AttnError::Shape)?;
         Ok(Self {
             shape,
             max_seq,
@@ -99,8 +94,6 @@ impl AttnWorkspace {
             att: zeros(dims.q_dim),
             proj: zeros(dims.hidden),
             probs: zeros(max_seq),
-            pack_k: zeros(pack),
-            pack_v: zeros(pack),
         })
     }
 
@@ -197,10 +190,11 @@ fn zeros(n: usize) -> Vec<f32> {
 /// There is no `o_proj` bias lookup.
 ///
 /// Q and K are rotated in place with NeoX RoPE at `pos`. V is not rotated.
-/// K and V are then packed with the committed prefix and scored by
-/// [`gqa_attn_f32`] over that prefix (`GqaMask::Full`). The cache slot is
-/// written only after that op and `o_proj` both accept the buffers. The
-/// cursor stays put.
+/// The committed prefix is read from the cache at `kv_stride = max_seq`.
+/// This token's K and V are passed beside that buffer, so the prefix is not
+/// copied. [`gqa_attn_f32_strided`] scores the prefix (`GqaMask::Full`). The
+/// cache slot is written only after that op and `o_proj` both accept the
+/// buffers. The cursor stays put.
 ///
 /// `pos` must equal `cache.len()`, and `work.max_seq()` must equal
 /// `cache.max_seq()`.
@@ -266,36 +260,29 @@ pub fn attention_layer(
         .map_err(|_| AttnError::Shape)?;
 
     let seq = pos + 1;
-    let packed = dims
-        .kv_heads
-        .checked_mul(seq)
-        .and_then(|n| n.checked_mul(dims.head_dim))
-        .ok_or(AttnError::Shape)?;
-    cache
-        .pack_prefix_with_token(
-            layer,
-            pos,
-            &work.k,
-            &work.v,
-            &mut work.pack_k,
-            &mut work.pack_v,
+    let stride = cache.max_seq();
+    {
+        let layer_k = cache.layer_keys(layer).map_err(AttnError::Cache)?;
+        let layer_v = cache.layer_values(layer).map_err(AttnError::Cache)?;
+        gqa_attn_f32_strided(
+            &mut work.att,
+            &work.q,
+            layer_k,
+            layer_v,
+            Some(&work.k),
+            Some(&work.v),
+            &mut work.probs[..seq],
+            GqaShape {
+                num_q_heads: dims.q_heads,
+                num_kv_heads: dims.kv_heads,
+                head_dim: dims.head_dim,
+                seq_len: seq,
+            },
+            GqaMask::Full,
+            stride,
         )
-        .map_err(AttnError::Cache)?;
-    gqa_attn_f32(
-        &mut work.att,
-        &work.q,
-        &work.pack_k[..packed],
-        &work.pack_v[..packed],
-        &mut work.probs[..seq],
-        GqaShape {
-            num_q_heads: dims.q_heads,
-            num_kv_heads: dims.kv_heads,
-            head_dim: dims.head_dim,
-            seq_len: seq,
-        },
-        GqaMask::Full,
-    )
-    .map_err(|_| AttnError::Shape)?;
+        .map_err(|_| AttnError::Shape)?;
+    }
     gemv_bf16(
         &mut work.proj,
         o_w.bytes,

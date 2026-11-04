@@ -67,3 +67,4 @@
 1. 刀⑦已合 main @ `a92677f1`（PR #39）。账本刀⑦行与 `arena/s1-myos-bf16-cost-card.md` 是该收口的 host 中位。刀⑧补测不改这些数字。
 2. 刀⑧硬闸 L_TTFT / T_decode / CORRECT / DET 已过：L_TTFT 2193.653 ≤ 3000，且相对刀⑦ 9092.903 ≈ 4.15×；T_decode 14.9912 ≥ 12.9；CORRECT=PASS、DET=PASS。场景加权和恰好 −80。口径写的是「优于 −80」；深析判此项未过（TTFT 达标、场景分未改善）。不对外宣称场景改善或场景胜。
 3. 刀⑨ host 已填（`595943d`，指纹 `s1-myos-bf16-t8-k9`）：CORRECT/DET PASS；L_TTFT 1994.139 ≲ 2413；T_decode 15.4880（要 ≥16.42，或 ≥16.37 且加权优于 −80）**未过**；加权仍 −80。详见 `docs/phase1-knife9-verdict-and-knife10.md`（本地草稿）。不对外宣称 decode 平带或场景改善。不在本步开 S2/S3/S6，副赛道 Q4 保持关闭。
+4. 刀⑫（Attention / GQA / KV 直读）代码待 host 填。指纹 `runs/s1-myos-bf16-t8-k12/`，草稿卡 `arena/s1-myos-bf16-t8-k12-cost-card.md` 为 **UNMEASURED**。不改上表刀⑨中位，不把未测数字写成平带或场景胜。口径：`docs/phase1-knife11-verdict-and-knife12.md`。
