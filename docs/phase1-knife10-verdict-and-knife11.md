@@ -75,3 +75,5 @@ cargo build -p myos_runtime --release
   --fingerprint-dir runs/s1-myos-bf16-t8-k11 \
   --cost-card arena/s1-myos-bf16-t8-k11-cost-card.md
 ```
+
+刀⑪ host 负结果与刀⑫口径见 `docs/phase1-knife11-verdict-and-knife12.md`（#50 不合入；基线仍刀⑨ T_decode 15.4880）。
