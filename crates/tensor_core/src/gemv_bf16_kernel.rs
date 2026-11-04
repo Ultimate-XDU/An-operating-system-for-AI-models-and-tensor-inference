@@ -223,7 +223,7 @@ fn dot_row(row: &[u8], x: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn avx2_available() -> bool {
+pub(crate) fn avx2_available() -> bool {
     use core::sync::atomic::{AtomicU8, Ordering};
     static CACHE: AtomicU8 = AtomicU8::new(0);
     match CACHE.load(Ordering::Relaxed) {

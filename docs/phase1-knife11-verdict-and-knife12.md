@@ -33,24 +33,27 @@
 | M_peak | 2963.496 | 3050.953 | 0.9713 | T（合成按协议） |
 | 场景 | — | — | 加权 −80 | L |
 
-## ② 刀⑫ · 跳出融合同族，也跳出 GEMV 形态同族（一口 Attention / GQA / KV 布局）
+## ② 刀⑫ · Attention 按 cache stride 直读已落地（端到端 UNMEASURED）
 
-**目标**：在刀⑨基线上，一口改 **Attention / GQA / KV 布局**，把 T_decode 推进协议平带，从而场景加权 **严格优于 −80**。这一口离开多投影融合同族，也离开 GEMV 行块 / 寄存器块同族。
+一口粗改，默认路径没有新开关。对照基线是刀⑨ host 中位 **T_decode 15.4880**（指纹 `s1-myos-bf16-t8-k9`），禁止用刀⑪的 11.5767 或刀⑩的 11.8074 当对照。这一口离开多投影融合同族，也离开 GEMV 行块 / 寄存器块同族。
 
 ### 改动面
 
-- Attention、GQA、KV 布局，一口
-- 仍 BF16+fp32 acc、先乘后加、`threads=8`、`MYOS_GEMV_PACK` 默认关、预取默认关
-- prefill 保持刀⑧ chunk；不回退串行 `forward_token`×n_prompt
+- `KvCache` 仍是 `[num_kv_heads, max_seq, head_dim]`。decode 不再每步 `pack_prefix_with_token`。已提交的前缀按 `kv_stride = max_seq` 直接读；当前 token 的 K/V 放在旁边，注意力接受之后才 `store`。不整段 pack。
+- prefill 仍是刀⑧的整段 chunk。K/V 已经 `store_at` 进 cache，`attend_chunk` 用同一 stride 读，不再 `pack_prefix`。因果掩码仍是前缀。不回退串行 `forward_token`×n_prompt。
+- `gqa_attn_f32` 的点积、softmax、每条输出 lane 的累加顺序不变：先乘后加，不 `mul_add`，softmax 仍是 max、`expf(score - max)`、从左到右求和、`e / sum`。同一 KV head 的 query（1.5B 为 6）一起走这些链；V 的多条 lane 一起走，每条 lane 仍按 token 从左到右加。
+- 仍 BF16+fp32 acc、`threads=8`、`MYOS_GEMV_PACK` 默认关、预取默认关。不改 GEMV 行宽 / 寄存器块，不做 fused multi-GEMV，不改乘加序，不调 threads，不开 S2 / Q4。
 
-### 硬验收
+### 硬门（host 补测；本环境无 1.5B 权重）
 
-- S1 CORRECT + DET @ `threads=8`
-- T_decode ≥ **16.42** tok/s **或** 至少 T_decode ≥ **16.37** 且场景加权 **严格优于 −80**
-- L_TTFT ≤ **2193.6** ms
-- **相对刀⑨** T_decode ≥ **15.4880**
-- 指纹另开：`runs/s1-myos-bf16-t8-k12/`；更新 cost-card / scoreboard
-- **不做** S2 / Q4。硬门过则要求加权严格优于 −80
+| 硬门 | 门槛 |
+|------|------|
+| CORRECT / DET | PASS @ threads=8 |
+| T_decode | ≥ **16.42**，或（≥ **16.37** 且场景加权严格优于 −80） |
+| L_TTFT | ≤ **2193.6** |
+| 相对刀⑨ | T_decode ≥ **15.4880** |
+
+指纹目录：`runs/s1-myos-bf16-t8-k12/`。账本草稿：`arena/s1-myos-bf16-t8-k12-cost-card.md`。端到端 S1 在写这份草稿的环境里是 **UNMEASURED**。上表没有填实测中位。不把空位读成平带或场景胜。**不做** S2 / Q4。硬门过则要求加权严格优于 −80。
 
 ### 不做
 
@@ -61,9 +64,7 @@
 - 用 11.5767 / 11.8074 当改善基线
 - 开 S2 / Q4
 
-### 交付
-
-- 一块 PR；host 补测同形：
+### host 补测
 
 ```bash
 cargo build -p myos_runtime --release
@@ -79,3 +80,5 @@ cargo build -p myos_runtime --release
   --fingerprint-dir runs/s1-myos-bf16-t8-k12 \
   --cost-card arena/s1-myos-bf16-t8-k12-cost-card.md
 ```
+
+硬门在 host 填中位之后再判。不在本刀开 S2 / Q4。

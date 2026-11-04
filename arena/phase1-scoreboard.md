@@ -1,8 +1,8 @@
 # Phase1 Scoreboard（评测账本）
 
 **协议**：`PHASE1-ARENA-PROTOCOL-v0.1.md`  
-**更新**：2026-11-04 · 刀⑪ host 中位已填：T_decode **11.5767**（相对刀⑨ 15.4880 回退约 −25.3%，略差于刀⑩ 11.8074）；CORRECT/DET PASS；硬门 FAIL；场景仍 −80。对照仍刀⑨。  
-**合入**：刀⑨代码基线在 main @ `1460ef22`（PR #43）；刀⑩账本 #47 已合。#45 不合入。刀⑪多投影融合 **#50 已关，不合入**。不改刀⑦/刀⑧/刀⑨已填中位。
+**更新**：2026-11-04 · 刀⑪ host 中位已填：T_decode **11.5767**（相对刀⑨ 15.4880 回退约 −25.3%，略差于刀⑩ 11.8074）；CORRECT/DET PASS；硬门 FAIL；场景仍 −80。刀⑫草稿 UNMEASURED（指纹 `s1-myos-bf16-t8-k12`），对照仍用刀⑨ T_decode **15.4880**。  
+**合入**：刀⑨代码基线在 main @ `1460ef22`（PR #43）；刀⑩账本 #47 已合。#45 不合入。刀⑪多投影融合 **#50 已关，不合入**。不改刀⑦/刀⑧/刀⑨已填中位。刀⑫不改刀⑪已填中位。
 
 ---
 
@@ -13,7 +13,7 @@
 | E0 冻结 | ✅ | v0.1：1.5B / exact / S3=4096 / CPU / ±5% |
 | E1 llama 基线 S1 | 🟡 部分 | 主赛道 BF16+FP16 DET-PASS；副赛道 Q4 DET-FAIL 仅参考 |
 | E2 MyOS exact S1 | ✅ | CORRECT PASS vs BF16 金标准（当时 threads=1） |
-| 主赛道 S1 吞吐对打 | ✅ 可比已落地 | 刀⑦与刀⑧ host W=3/R=5 中位均已填。刀⑧ CORRECT/DET PASS；L_TTFT 2193.653；场景仍 **L**（加权和 -80）。刀⑨ host 已填：T_decode 15.4880、场景仍 −80，硬门未过。刀⑩ host 中位 T_decode 11.8074（相对刀⑨回退约 24%，硬门 FAIL，#45 不合入）。刀⑪ host 中位 T_decode 11.5767（相对刀⑨回退约 −25.3%，略差于刀⑩，硬门 FAIL，#50 不合入）。卡：刀⑦ `arena/s1-myos-bf16-cost-card.md`；刀⑧ `arena/s1-myos-bf16-t8-k8-cost-card.md`；刀⑨ `arena/s1-myos-bf16-t8-k9-cost-card.md`；刀⑩ `arena/s1-myos-bf16-t8-k10-cost-card.md`；刀⑪ `arena/s1-myos-bf16-t8-k11-cost-card.md` |
+| 主赛道 S1 吞吐对打 | ✅ 可比已落地 | 刀⑦与刀⑧ host W=3/R=5 中位均已填。刀⑧ CORRECT/DET PASS；L_TTFT 2193.653；场景仍 **L**（加权和 -80）。刀⑨ host 已填：T_decode 15.4880、场景仍 −80，硬门未过。刀⑩ host 中位 T_decode 11.8074（相对刀⑨回退约 24%，硬门 FAIL，#45 不合入）。刀⑪ host 中位 T_decode 11.5767（相对刀⑨回退约 −25.3%，略差于刀⑩，硬门 FAIL，#50 不合入）。刀⑫草稿 UNMEASURED。卡：刀⑦ `arena/s1-myos-bf16-cost-card.md`；刀⑧ `arena/s1-myos-bf16-t8-k8-cost-card.md`；刀⑨ `arena/s1-myos-bf16-t8-k9-cost-card.md`；刀⑩ `arena/s1-myos-bf16-t8-k10-cost-card.md`；刀⑪ `arena/s1-myos-bf16-t8-k11-cost-card.md`；刀⑫ `arena/s1-myos-bf16-t8-k12-cost-card.md` |
 | 副赛道 Q4 对打 | ⬜ 未开 | 协议：不对打直至另议 |
 
 ---
@@ -28,6 +28,7 @@
 | MyOS threads=8（刀⑨ decode） | `s1-myos-bf16-t8-k9` | **PASS** | **PASS** | 15.4880 | 1994.139 | 64.566 | 2963.445 | host 2026-11-04 ≈08:48–08:50 UTC+8；软件预取默认关；`gemv_pack=false`；commit `595943d`。T_decode 未达平带（要 ≥16.37/16.42），场景加权仍 −80。卡：`arena/s1-myos-bf16-t8-k9-cost-card.md`。口径：`docs/phase1-knife8-verdict-and-knife9.md` |
 | MyOS threads=8（刀⑩ decode 行切） | `s1-myos-bf16-t8-k10` | **PASS** | **PASS** | 11.8074 | 2042.858 | 84.693 | 2963.469 | host W=3/R=5 @ `0086dd05`；相对刀⑨ T_decode 15.4880→11.8074 回退约 24%；硬门 FAIL；#45 不合入；场景加权仍 −80。卡：`arena/s1-myos-bf16-t8-k10-cost-card.md`。口径：`docs/phase1-knife10-verdict-and-knife11.md` |
 | MyOS threads=8（刀⑪ decode 融合） | `s1-myos-bf16-t8-k11` | **PASS** | **PASS** | 11.5767 | 2180.442 | 86.380 | 2963.496 | host W=3/R=5 @ `phase1/knife11-fused-decode@491260a`（**#50 已关，不合入**）；相对刀⑨ T_decode 15.4880→11.5767 回退约 −25.3%（略差于刀⑩ 11.8074）；L_TTFT 2180.442 ≤ 2193.6 过；硬门 FAIL；场景加权仍 −80。卡：`arena/s1-myos-bf16-t8-k11-cost-card.md`。口径：`docs/phase1-knife11-verdict-and-knife12.md` |
+| MyOS threads=8（刀⑫ attention 直读） | `s1-myos-bf16-t8-k12` | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | KV 直读草稿。云端无 1.5B 权重，中位待 host。decode / prefill 按 `kv_stride = max_seq` 读 cache，不再整段 pack。点积与 value lane 仍从左到右先乘后加。对照刀⑨ T_decode **15.4880**。硬门：CORRECT+DET PASS；T_decode ≥16.42 或（≥16.37 且加权严格优于 −80）；L_TTFT ≤2193.6；相对刀⑨ T_decode ≥15.4880。卡：`arena/s1-myos-bf16-t8-k12-cost-card.md`。口径：`docs/phase1-knife11-verdict-and-knife12.md` |
 | MyOS `42acbb39` | `e2-myos-s1` | （单次 greedy） | **PASS** exact 128/128 | — | — | — | — | 历史正确性收口；指纹 threads=1，**不**拿来和 `-t 8` 比吞吐 |
 | llama.cpp b11960 | `s1-llamacpp-fp16-b11960` | PASS | （非 E2 ref） | 18.84 | 841.1 | 53.07 | 6377 | 官方 FP16；并列主赛道参考，非本 E2 金标准 |
 
@@ -71,3 +72,4 @@
 3. 刀⑨ host 已填（`595943d`，指纹 `s1-myos-bf16-t8-k9`）：CORRECT/DET PASS；L_TTFT 1994.139 ≲ 2413；T_decode 15.4880（要 ≥16.42，或 ≥16.37 且加权优于 −80）**未过**；加权仍 −80。详见 `docs/phase1-knife9-verdict-and-knife10.md`（本地草稿）。不对外宣称 decode 平带或场景改善。不改这些数字。
 4. 刀⑩ host 已填（`0086dd05`，指纹 `s1-myos-bf16-t8-k10`）：CORRECT/DET PASS；L_TTFT 2042.858 ≤ 2193.6；T_decode **11.8074**（要 ≥16.42，或 ≥16.37 且加权优于 −80）**未过且相对刀⑨ 15.4880 回退约 24%**；加权仍 −80；硬门 FAIL；**#45 不合入**。下一刀基线 = 刀⑨（`1460ef22` / T_decode 15.4880），禁止用 11.81 当改善基线。卡：`arena/s1-myos-bf16-t8-k10-cost-card.md`。口径：`docs/phase1-knife10-verdict-and-knife11.md`。禁止把回退写成改善。不在本步开 S2/S3/S6，副赛道 Q4 保持关闭。
 5. 刀⑪ host 已填（`phase1/knife11-fused-decode@491260a`，指纹 `s1-myos-bf16-t8-k11`）：CORRECT/DET PASS；L_TTFT 2180.442 ≤ 2193.6；T_decode **11.5767**（要 ≥16.42，或 ≥16.37 且加权严格优于 −80）**未过且相对刀⑨ 15.4880 回退约 −25.3%**（略差于刀⑩ 11.8074）；加权仍 −80；硬门 FAIL；**#50 已关，不合入**。对照与下一刀基线仍是刀⑨（`1460ef22` / T_decode 15.4880），禁止用 11.58 / 11.81 当改善基线。卡：`arena/s1-myos-bf16-t8-k11-cost-card.md`。口径：`docs/phase1-knife11-verdict-and-knife12.md`。禁止把回退写成改善。不在本步开 S2/S3/S6，副赛道 Q4 保持关闭。
+6. 刀⑫草稿（指纹 `s1-myos-bf16-t8-k12`）端到端 S1 **UNMEASURED**。粗路径是 attention 按 cache stride 读 KV，不整段 pack。对照基线是刀⑨ T_decode **15.4880**。host 填中位后再判硬门。不把未测数字写成达标，不改刀⑪中位。

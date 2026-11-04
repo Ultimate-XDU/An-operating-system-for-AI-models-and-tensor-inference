@@ -8,9 +8,10 @@
 //! `max_seq` here.
 //!
 //! The bytes are not ember's time-major `[pos, kv_dim]` buffer. Each layer is
-//! `[num_kv_heads, max_seq, head_dim]`, which is the slot layout
-//! [`tensor_core::gqa_attn_f32`] uses once a prefix is packed to length
-//! `seq_len`. Scores stay in that op.
+//! `[num_kv_heads, max_seq, head_dim]`. Tokens `0..seq` of one KV head are
+//! contiguous, so attention reads that slice in place (`kv_stride = max_seq`)
+//! instead of copying the prefix down to length `seq`. Scores stay in
+//! [`tensor_core::gqa_attn_f32`].
 //!
 //! Qwen2.5-1.5B is [`KvShape::qwen25_1_5b`]: 28 layers, 2 KV heads, head dim
 //! 128. A test passes a smaller [`KvShape`]. This type does not run attention.
@@ -250,55 +251,33 @@ impl KvCache {
         Ok(&self.v[off..off + self.shape.head_dim])
     }
 
-    /// Pack K and V for `gqa_attn_f32`: previous slots `0..pos`, then `new_*`
-    /// at index `pos`.
+    /// One layer of K, layout `[num_kv_heads, max_seq, head_dim]`.
     ///
-    /// Destination layout is `[num_kv_heads, pos + 1, head_dim]`. `dst_k` and
-    /// `dst_v` must be at least that long. This does not write the cache.
-    /// The caller stores after the attention op accepts the prefix.
-    pub(crate) fn pack_prefix_with_token(
-        &self,
-        layer: usize,
-        pos: usize,
-        new_k: &[f32],
-        new_v: &[f32],
-        dst_k: &mut [f32],
-        dst_v: &mut [f32],
-    ) -> Result<(), KvError> {
-        let kv_dim = self.kv_dim()?;
-        if new_k.len() != kv_dim || new_v.len() != kv_dim {
-            return Err(KvError::Shape);
-        }
+    /// Attention uses this with `kv_stride = max_seq` so a prefix of length
+    /// `seq <= max_seq` is the leading `seq` tokens of each head. No copy.
+    pub(crate) fn layer_keys(&self, layer: usize) -> Result<&[f32], KvError> {
+        let (start, n) = self.layer_span(layer)?;
+        Ok(&self.k[start..start + n])
+    }
+
+    /// One layer of V. Same layout as [`KvCache::layer_keys`].
+    pub(crate) fn layer_values(&self, layer: usize) -> Result<&[f32], KvError> {
+        let (start, n) = self.layer_span(layer)?;
+        Ok(&self.v[start..start + n])
+    }
+
+    fn layer_span(&self, layer: usize) -> Result<(usize, usize), KvError> {
         if layer >= self.shape.num_layers {
             return Err(KvError::Range);
         }
-        if pos >= self.shape.max_seq {
-            return Err(KvError::Full);
-        }
-        let seq = pos + 1;
-        let need = self
+        let n = self
             .shape
             .num_kv_heads
-            .checked_mul(seq)
-            .and_then(|n| n.checked_mul(self.shape.head_dim))
+            .checked_mul(self.shape.max_seq)
+            .and_then(|h| h.checked_mul(self.shape.head_dim))
             .ok_or(KvError::Shape)?;
-        if dst_k.len() < need || dst_v.len() < need {
-            return Err(KvError::Shape);
-        }
-        let head_dim = self.shape.head_dim;
-        for head in 0..self.shape.num_kv_heads {
-            for t in 0..pos {
-                let src = self.offset(layer, head, t)?;
-                let dst = (head * seq + t) * head_dim;
-                dst_k[dst..dst + head_dim].copy_from_slice(&self.k[src..src + head_dim]);
-                dst_v[dst..dst + head_dim].copy_from_slice(&self.v[src..src + head_dim]);
-            }
-            let dst = (head * seq + pos) * head_dim;
-            let src = head * head_dim;
-            dst_k[dst..dst + head_dim].copy_from_slice(&new_k[src..src + head_dim]);
-            dst_v[dst..dst + head_dim].copy_from_slice(&new_v[src..src + head_dim]);
-        }
-        Ok(())
+        let start = layer.checked_mul(n).ok_or(KvError::Shape)?;
+        Ok((start, n))
     }
 
     fn kv_dim(&self) -> Result<usize, KvError> {

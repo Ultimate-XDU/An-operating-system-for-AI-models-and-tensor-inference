@@ -14,9 +14,11 @@
 //! (HF Qwen2 `rotate_half`: lane `i` with lane `i + head_dim/2`);
 //! see the `rope` module.
 //! [`gqa_attn_f32`] is one query position against cached K/V: f32 dots,
-//! `1/sqrt(head_dim)`, serial softmax, then the value mix. Qwen2.5-1.5B
-//! passes 12 query heads and 2 KV heads ([`NUM_ATTENTION_HEADS_QWEN25_1_5B`],
-//! [`NUM_KV_HEADS_QWEN25_1_5B`]). See the `gqa` module.
+//! `1/sqrt(head_dim)`, serial softmax, then the value mix. [`gqa_attn_f32_strided`]
+//! is that op on a `max_seq` stride, optionally with the newest token beside
+//! the cache. Qwen2.5-1.5B passes 12 query heads and 2 KV heads
+//! ([`NUM_ATTENTION_HEADS_QWEN25_1_5B`], [`NUM_KV_HEADS_QWEN25_1_5B`]). See the
+//! `gqa` module.
 //! [`swiglu_bf16`] is the Qwen2 MLP: [`gemv_bf16`] for `mlp.gate_proj`,
 //! `mlp.up_proj`, and `mlp.down_proj`, then [`silu_f32`] on the gate
 //! (`z / (1 + expf(-z))`) times up. No bias on any of the three. Activations
@@ -62,8 +64,8 @@ pub use gemv_bf16_kernel::{
     SHOWDOWN_THREADS,
 };
 pub use gqa::{
-    attn_scale_f32, gqa_attn_f32, GqaError, GqaMask, GqaShape, GQA_Q_PER_KV_QWEN25_1_5B,
-    NUM_ATTENTION_HEADS_QWEN25_1_5B, NUM_KV_HEADS_QWEN25_1_5B,
+    attn_scale_f32, gqa_attn_f32, gqa_attn_f32_strided, GqaError, GqaMask, GqaShape,
+    GQA_Q_PER_KV_QWEN25_1_5B, NUM_ATTENTION_HEADS_QWEN25_1_5B, NUM_KV_HEADS_QWEN25_1_5B,
 };
 pub use rope::{
     rope_f32, rope_f32_inplace, rope_inv_freqs, RopeError, HEAD_DIM_QWEN25_1_5B, ROPE_THETA_QWEN25,
