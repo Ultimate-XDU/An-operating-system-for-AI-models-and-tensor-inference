@@ -434,6 +434,8 @@ fn row(myos: f64, base: f64, higher_is_better: bool) -> VerdictRow {
 }
 
 pub struct CostCard {
+    /// Run directory name, for example `s1-myos-bf16-t8-k8`.
+    pub fingerprint: String,
     pub threads: u64,
     pub batch: u64,
     pub gemv_pack: bool,
@@ -461,10 +463,7 @@ pub fn render_cost_card(card: &CostCard) -> String {
         card.threads
     ));
     out.push_str("### 设定\n");
-    out.push_str(&format!(
-        "- fingerprint: `s1-myos-bf16-t{}`\n",
-        card.threads
-    ));
+    out.push_str(&format!("- fingerprint: `{}`\n", card.fingerprint));
     out.push_str("- model: Qwen2.5-1.5B-Instruct\n");
     out.push_str("- track: SafeTensors BF16 (main track)\n");
     out.push_str(&format!("- device: cpu, n_threads: {}\n", card.threads));
@@ -549,12 +548,12 @@ pub fn render_cost_card(card: &CostCard) -> String {
     out.push_str(&format!("- det consistency: {}\n", card.det));
     out.push_str("\n### 代价拆解\n");
     out.push_str(&format!(
-        "- 算力：GEMV 行块分给 {} 个 worker；每行内部仍是 `j=0..k-1` 先乘后加，非 FMA，与 scalar `dot_row` 同比特。无跨行归约。\n",
+        "- 算力：decode 仍是 GEMV 行块分给 {} 个 worker。prefill 把整段 prompt 做成一次分块投影（同一权重行乘上 chunk 内每个 token）。每个 (token, 行) 仍是 `j=0..k-1` 先乘后加，非 FMA，无跨行归约，不 pack 权重。\n",
         card.threads
     ));
     out.push_str("- 内存：`M_peak` 是加载完成后、prefill 与 decode 期间的 VmRSS 峰值。权重保持 BF16 视图，无整表 f32。\n");
     out.push_str("- 工程：数值核 no_std；`std` 线程池只做确定行分割。刀⑥ panel pack 默认关（`gemv_pack` 见上）。\n");
-    out.push_str("- 功能债：batch 仍为 1。本卡不含 S2/S3，不含 Q4。\n");
+    out.push_str("- 功能债：协议 batch 仍为 1。本卡不含 S2/S3，不含 Q4。\n");
     out.push_str("\n### 结论一句\n");
     out.push_str(&format!(
         "- 胜负：{}\n",
@@ -572,7 +571,7 @@ pub fn render_cost_card(card: &CostCard) -> String {
     }
     out.push_str("\n### 计量边界（协议 §2.1）\n");
     out.push_str("1. `t_load` 单独计，不进入 L_prefill / T_decode。\n");
-    out.push_str("2. `t_prefill`：从提交 prompt tokens 到产出第一个新 token 之前（含 KV / workspace 分配与 `n_prompt` 次 forward）。\n");
+    out.push_str("2. `t_prefill`：从提交 prompt tokens 到产出第一个新 token 之前（含 KV / workspace 分配与整段 chunk prefill，不是 `n_prompt` 次 decode 同构 forward）。\n");
     out.push_str("3. `t_decode`：`greedy_decode` 跑完 `n_gen` 个新 token。`T_decode = n_gen / t_decode`，`L_TPOT = t_decode / n_gen`，`L_TTFT = t_prefill`。\n");
     out
 }
@@ -1010,6 +1009,7 @@ mod tests {
     #[test]
     fn unmeasured_card_keeps_llama_denominator_and_refuses_a_win() {
         let text = render_cost_card(&CostCard {
+            fingerprint: "s1-myos-bf16-t8-k8".to_string(),
             threads: 8,
             batch: 1,
             gemv_pack: false,
@@ -1026,6 +1026,8 @@ mod tests {
             measured_on_this_machine: false,
             extra_note: String::new(),
         });
+        assert!(text.contains("s1-myos-bf16-t8-k8"), "{text}");
+        assert!(text.contains("分块投影"), "{text}");
         assert!(text.contains("UNMEASURED"), "{text}");
         assert!(text.contains("17.2348"), "{text}");
         assert!(text.contains("608.110"), "{text}");
@@ -1049,6 +1051,7 @@ mod tests {
             m_peak_mib: 4000.0,
         };
         let text = render_cost_card(&CostCard {
+            fingerprint: "s1-myos-bf16-t8-k8".to_string(),
             threads: 8,
             batch: 1,
             gemv_pack: false,

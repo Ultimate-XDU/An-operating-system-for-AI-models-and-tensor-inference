@@ -117,10 +117,7 @@ pub struct Qwen25LayerView<'a> {
 ///
 /// `index` must be in `0..NUM_HIDDEN_LAYERS` (0 and 27 are the ends).
 /// Each tensor must be BF16 with the layout shape. Bytes stay in `map`.
-pub fn layer(
-    map: &impl WeightMap,
-    index: usize,
-) -> Result<Qwen25LayerView<'_>, QwenBf16Error> {
+pub fn layer(map: &impl WeightMap, index: usize) -> Result<Qwen25LayerView<'_>, QwenBf16Error> {
     if index >= NUM_HIDDEN_LAYERS {
         return Err(QwenBf16Error::LayerOutOfRange);
     }

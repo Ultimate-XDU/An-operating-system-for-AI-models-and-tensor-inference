@@ -465,7 +465,8 @@ fn ref_ids_on_block_fixture_prints_correct_and_exits_zero() {
 fn threads_flag_is_recorded_and_does_not_change_block_fixture_tokens() {
     let eight = Scratch::new("threads-8");
     let one = Scratch::new("threads-1");
-    let (ok8, _, out8, err8) = stdout(myos(eight.path()).args(["--block-fixture", "--threads", "8"]));
+    let (ok8, _, out8, err8) =
+        stdout(myos(eight.path()).args(["--block-fixture", "--threads", "8"]));
     let (ok1, _, out1, err1) = stdout(myos(one.path()).args(["--block-fixture", "--threads", "1"]));
     assert!(ok8, "{err8}");
     assert!(ok1, "{err1}");
@@ -487,7 +488,10 @@ fn threads_flag_is_recorded_and_does_not_change_block_fixture_tokens() {
     assert!(json8.contains("\"gemv_pack\": false"), "{json8}");
     assert!(json8.contains("\"batch\": 1"), "{json8}");
     assert!(json8.contains("\"quant_or_dtype\": \"bf16\""), "{json8}");
-    assert!(json8.contains("\"acc_path\": \"bf16_w_fp32_acc\""), "{json8}");
+    assert!(
+        json8.contains("\"acc_path\": \"bf16_w_fp32_acc\""),
+        "{json8}"
+    );
 }
 
 #[test]

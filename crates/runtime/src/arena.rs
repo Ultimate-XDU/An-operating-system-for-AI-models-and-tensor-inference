@@ -198,7 +198,14 @@ fn summarize(
     let gates_pass = correct_pass && det_pass;
     let verdict = meter::verdict(Some(&medians), comparable, gates_pass);
     let n_prompt = scored_samples[0].n_prompt;
+    let fingerprint = job
+        .out_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("s1-myos-bf16")
+        .to_string();
     let card = render_cost_card(&CostCard {
+        fingerprint,
         threads: job.threads as u64,
         batch: 1,
         gemv_pack,

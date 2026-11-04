@@ -102,7 +102,7 @@ This file is not a llama.cpp exact comparison.";
 const NOTES_E2: &str = "\
 model_sha256 is null: this process does not hash the file and does not copy the layout doc LFS oid. \
 seed is null: greedy argmax has no RNG. \
-E2-capable multi-token path: --prompt-ids is prefilled in order, then greedy --steps tokens are decoded. \
+E2-capable multi-token path: --prompt-ids is prefilled as one chunk (projections and a causal KV write), then greedy --steps tokens are decoded with forward_token. \
 n_prompt is that file's length and n_gen is --steps (protocol S1 is n_prompt=128, n_gen=128). \
 n_ctx is n_prompt + n_gen, the KvCache max_seq for this process. \
 model_id is set only when layout is qwen25_1_5b. \

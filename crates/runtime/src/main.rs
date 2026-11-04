@@ -595,6 +595,10 @@ impl From<WeightError> for WeightsError {
     }
 }
 
+fn showdown_id(threads: usize) -> String {
+    format!("s1-myos-bf16-t{threads}-k8")
+}
+
 fn write_cli_fingerprint(
     kind: RunKind,
     shape: BlockShape,
@@ -619,9 +623,7 @@ fn write_cli_fingerprint(
         e2_prompt_ids: cli.prompt_ids.is_some(),
         threads: cli.threads as u64,
         gemv_pack: tensor_core::gemv_bf16_panel_pack(),
-        run_id: cli
-            .arena_s1
-            .then(|| format!("s1-myos-bf16-t{}", cli.threads)),
+        run_id: cli.arena_s1.then(|| showdown_id(cli.threads)),
     });
     let path = write_run_fingerprint(&dir, &fp)?;
     if let Some(ids) = generated {
@@ -713,14 +715,11 @@ fn run_arena_cli(cli: &Cli) -> ExitCode {
     };
     let out_dir = match &cli.fingerprint_dir {
         Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(format!("runs/s1-myos-bf16-t{}", cli.threads)),
+        None => PathBuf::from(format!("runs/{}", showdown_id(cli.threads))),
     };
     let cost_card = match &cli.cost_card {
         Some(path) => PathBuf::from(path),
-        None if cli.threads == tensor_core::SHOWDOWN_THREADS => {
-            PathBuf::from("arena/s1-myos-bf16-cost-card.md")
-        }
-        None => PathBuf::from(format!("arena/s1-myos-bf16-t{}-cost-card.md", cli.threads)),
+        None => PathBuf::from(format!("arena/{}-cost-card.md", showdown_id(cli.threads))),
     };
     let bin = match env::current_exe() {
         Ok(path) => path,
