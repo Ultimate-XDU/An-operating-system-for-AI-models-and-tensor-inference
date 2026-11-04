@@ -1395,4 +1395,212 @@ mod tests {
             t8 / reps as f64
         );
     }
+
+    fn bits_of(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Fused same-x GEMV matches one [`crate::gemv_bf16`] per segment.
+    #[test]
+    fn same_x_matches_separate_gemv_bits() {
+        let groups = [
+            vec![(4usize, 7usize), (1, 7), (9, 7)],
+            vec![(32, 16), (32, 16)],
+            vec![(48, 17), (7, 17)],
+            vec![(256, 64), (32, 64), (40, 64)],
+            vec![(15, 8)],
+            vec![(0, 4), (3, 4)],
+        ];
+        for threads in [1usize, 3, 8] {
+            for (gi, group) in groups.iter().enumerate() {
+                let k = group[0].1;
+                let x = pattern_x_local(k, 0xA11 ^ (gi as u32) ^ (threads as u32));
+                let mut ws = Vec::new();
+                let mut separate = Vec::new();
+                for (si, &(m, _)) in group.iter().enumerate() {
+                    let w = if m == 0 {
+                        Vec::new()
+                    } else {
+                        pattern_w_local(m * k, 0xB00 + si as u32 + gi as u32)
+                    };
+                    let mut y = vec![0.0f32; m];
+                    crate::bf16::gemv_bf16_at_threads(&mut y, &w, &x, m, k, threads).unwrap();
+                    separate.push(y);
+                    ws.push(w);
+                }
+                let mut fused_ys: Vec<Vec<f32>> =
+                    group.iter().map(|&(m, _)| vec![1.0; m]).collect();
+                {
+                    let mut outs: Vec<crate::GemvOut<'_>> = fused_ys
+                        .iter_mut()
+                        .zip(ws.iter())
+                        .map(|(y, w)| crate::GemvOut {
+                            y: y.as_mut_slice(),
+                            w: w.as_slice(),
+                        })
+                        .collect();
+                    crate::bf16::gemv_bf16_same_x_at_threads(&mut outs, &x, threads).unwrap();
+                }
+                for (got, expect) in fused_ys.iter().zip(separate.iter()) {
+                    assert_eq!(
+                        bits_of(got),
+                        bits_of(expect),
+                        "threads={threads} group={gi}"
+                    );
+                }
+            }
+        }
+
+        // A short second matrix must not clobber the first y.
+        let mut y0 = vec![3.0f32; 4];
+        let mut y1 = vec![4.0f32; 4];
+        let w0 = pattern_w_local(4 * 3, 1);
+        let w1 = vec![0u8; 3];
+        let x = pattern_x_local(3, 2);
+        let before0 = y0.clone();
+        let before1 = y1.clone();
+        let err = {
+            let mut outs = [
+                crate::GemvOut {
+                    y: y0.as_mut_slice(),
+                    w: w0.as_slice(),
+                },
+                crate::GemvOut {
+                    y: y1.as_mut_slice(),
+                    w: w1.as_slice(),
+                },
+            ];
+            crate::bf16::gemv_bf16_same_x_at_threads(&mut outs, &x, 8)
+        };
+        assert!(err.is_err());
+        assert_eq!(y0, before0);
+        assert_eq!(y1, before1);
+
+        let mut z0 = vec![1.0f32; 2];
+        let mut z1 = vec![1.0f32; 3];
+        {
+            let mut outs = [
+                crate::GemvOut {
+                    y: z0.as_mut_slice(),
+                    w: &[],
+                },
+                crate::GemvOut {
+                    y: z1.as_mut_slice(),
+                    w: &[],
+                },
+            ];
+            crate::bf16::gemv_bf16_same_x_at_threads(&mut outs, &[], 4).unwrap();
+        }
+        assert_eq!(z0, vec![0.0; 2]);
+        assert_eq!(z1, vec![0.0; 3]);
+    }
+
+    fn pattern_w_local(n: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut w = vec![0u8; n * 2];
+        for chunk in w.chunks_mut(2) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let bf = (state & 0x807F) | (0x3F00);
+            chunk.copy_from_slice(&(bf as u16).to_le_bytes());
+        }
+        w
+    }
+
+    fn pattern_x_local(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed | 1;
+        let mut x = vec![0.0f32; n];
+        for xj in &mut x {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *xj = f32::from_bits((state & 0x807F_FFFF) | (0x3F00_0000));
+        }
+        x
+    }
+
+    /// Release-only. Prints fused Q/K/V and gate/up against separate GEMVs.
+    /// Not an S1 median. Debug builds skip the timing.
+    #[test]
+    fn release_same_x_fusion_versus_separate_gemv() {
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let threads = 8usize;
+        let k = HIDDEN_SIZE_QWEN25_1_5B;
+        let qkv_m = [HIDDEN_SIZE_QWEN25_1_5B, 256usize, 256];
+        let mut qkv_w = Vec::new();
+        for (i, &m) in qkv_m.iter().enumerate() {
+            qkv_w.push(normal_panel(m, k, 0x1100 + i as u32).0);
+        }
+        let x = normal_panel(1, k, 0x51).1;
+        let mut qkv_y: Vec<Vec<f32>> = qkv_m.iter().map(|&m| vec![0.0f32; m]).collect();
+        let reps = 20usize;
+        let separate = elapsed_secs(4, || {
+            for _ in 0..reps {
+                for ((y, w), &m) in qkv_y.iter_mut().zip(qkv_w.iter()).zip(qkv_m.iter()) {
+                    crate::bf16::gemv_bf16_at_threads(y, w, &x, m, k, threads).unwrap();
+                }
+            }
+            std::hint::black_box(&qkv_y);
+        });
+        let fused = elapsed_secs(4, || {
+            for _ in 0..reps {
+                let mut outs: Vec<crate::GemvOut<'_>> = qkv_y
+                    .iter_mut()
+                    .zip(qkv_w.iter())
+                    .map(|(y, w)| crate::GemvOut {
+                        y: y.as_mut_slice(),
+                        w: w.as_slice(),
+                    })
+                    .collect();
+                crate::bf16::gemv_bf16_same_x_at_threads(&mut outs, &x, threads).unwrap();
+            }
+            std::hint::black_box(&qkv_y);
+        });
+        eprintln!(
+            "knife11_same_x qkv m={qkv_m:?} k={k} threads={threads}: separate {:.6}s fused {:.6}s ratio_separate_over_fused {:.3} per_wave_fused {:.6}s",
+            separate,
+            fused,
+            separate / fused,
+            fused / reps as f64
+        );
+
+        let m = INTERMEDIATE_SIZE_QWEN25_1_5B;
+        let (gate_w, _) = normal_panel(m, k, 0x61);
+        let (up_w, x2) = normal_panel(m, k, 0x62);
+        let mut gate = vec![0.0f32; m];
+        let mut up = vec![0.0f32; m];
+        let sep = elapsed_secs(4, || {
+            for _ in 0..reps {
+                crate::bf16::gemv_bf16_at_threads(&mut gate, &gate_w, &x2, m, k, threads).unwrap();
+                crate::bf16::gemv_bf16_at_threads(&mut up, &up_w, &x2, m, k, threads).unwrap();
+            }
+            std::hint::black_box((&gate, &up));
+        });
+        let both = elapsed_secs(4, || {
+            for _ in 0..reps {
+                let mut outs = [
+                    crate::GemvOut {
+                        y: gate.as_mut_slice(),
+                        w: gate_w.as_slice(),
+                    },
+                    crate::GemvOut {
+                        y: up.as_mut_slice(),
+                        w: up_w.as_slice(),
+                    },
+                ];
+                crate::bf16::gemv_bf16_same_x_at_threads(&mut outs, &x2, threads).unwrap();
+            }
+            std::hint::black_box((&gate, &up));
+        });
+        eprintln!(
+            "knife11_same_x gate_up [{m}, {k}] threads={threads}: separate {:.6}s fused {:.6}s ratio_separate_over_fused {:.3} per_wave_fused {:.6}s",
+            sep,
+            both,
+            sep / both,
+            both / reps as f64
+        );
+    }
 }

@@ -22,7 +22,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use tensor_core::{
-    add_bf16_bias, gemv_bf16, gqa_attn_f32, rope_f32_inplace, GqaMask, GqaShape, ROPE_THETA_QWEN25,
+    add_bf16_bias, gemv_bf16, gemv_bf16_same_x, gqa_attn_f32, rope_f32_inplace, GemvOut, GqaMask,
+    GqaShape, ROPE_THETA_QWEN25,
 };
 
 use crate::kv_cache::{KvCache, KvError};
@@ -214,6 +215,38 @@ pub fn attention_layer(
     cache: &mut KvCache,
     work: &mut AttnWorkspace,
 ) -> Result<(), AttnError> {
+    // Shape, position, and cache before a missing weight.
+    attention_precheck(residual, proj_in, layer, pos, shape, cache, work)?;
+    let dims = dims_of(shape)?;
+    let q_w_shape = [dims.q_dim, dims.hidden];
+    let q_b_shape = [dims.q_dim];
+    let kv_w_shape = [dims.kv_dim, dims.hidden];
+    let kv_b_shape = [dims.kv_dim];
+    let o_w_shape = [dims.hidden, dims.q_dim];
+    let q_w = bf16_tensor(map, &q_proj_weight_key(layer), &q_w_shape).map_err(AttnError::Weight)?;
+    let q_b = bf16_tensor(map, &q_proj_bias_key(layer), &q_b_shape).map_err(AttnError::Weight)?;
+    let k_w =
+        bf16_tensor(map, &k_proj_weight_key(layer), &kv_w_shape).map_err(AttnError::Weight)?;
+    let k_b = bf16_tensor(map, &k_proj_bias_key(layer), &kv_b_shape).map_err(AttnError::Weight)?;
+    let v_w =
+        bf16_tensor(map, &v_proj_weight_key(layer), &kv_w_shape).map_err(AttnError::Weight)?;
+    let v_b = bf16_tensor(map, &v_proj_bias_key(layer), &kv_b_shape).map_err(AttnError::Weight)?;
+    let o_w = bf16_tensor(map, &o_proj_weight_key(layer), &o_w_shape).map_err(AttnError::Weight)?;
+    attention_from_bytes(
+        residual, proj_in, q_w.bytes, q_b.bytes, k_w.bytes, k_b.bytes, v_w.bytes, v_b.bytes,
+        o_w.bytes, layer, pos, shape, cache, work,
+    )
+}
+
+fn attention_precheck(
+    residual: &[f32],
+    proj_in: &[f32],
+    layer: usize,
+    pos: usize,
+    shape: AttnShape,
+    cache: &KvCache,
+    work: &AttnWorkspace,
+) -> Result<(), AttnError> {
     let dims = dims_of(shape)?;
     if proj_in.len() != dims.hidden || residual.len() != dims.hidden {
         return Err(AttnError::Shape);
@@ -233,32 +266,58 @@ pub fn attention_layer(
     if pos >= cache.max_seq() {
         return Err(AttnError::Cache(KvError::Full));
     }
+    Ok(())
+}
+
+/// Q/K/V/O bytes already borrowed. Same math as [`attention_layer`].
+///
+/// Decode calls this with views resolved once for the whole greedy loop.
+/// Q, K, and V still share one `proj_in` wave. Bias is added after that
+/// wave, not inside the dot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_from_bytes(
+    residual: &mut [f32],
+    proj_in: &[f32],
+    q_w: &[u8],
+    q_b: &[u8],
+    k_w: &[u8],
+    k_b: &[u8],
+    v_w: &[u8],
+    v_b: &[u8],
+    o_w: &[u8],
+    layer: usize,
+    pos: usize,
+    shape: AttnShape,
+    cache: &mut KvCache,
+    work: &mut AttnWorkspace,
+) -> Result<(), AttnError> {
+    attention_precheck(residual, proj_in, layer, pos, shape, cache, work)?;
+    let dims = dims_of(shape)?;
     let pos_u32 = u32::try_from(pos).map_err(|_| AttnError::Position)?;
 
-    let q_w_shape = [dims.q_dim, dims.hidden];
-    let q_b_shape = [dims.q_dim];
-    let kv_w_shape = [dims.kv_dim, dims.hidden];
-    let kv_b_shape = [dims.kv_dim];
-    let o_w_shape = [dims.hidden, dims.q_dim];
-    let q_w = bf16_tensor(map, &q_proj_weight_key(layer), &q_w_shape).map_err(AttnError::Weight)?;
-    let q_b = bf16_tensor(map, &q_proj_bias_key(layer), &q_b_shape).map_err(AttnError::Weight)?;
-    let k_w =
-        bf16_tensor(map, &k_proj_weight_key(layer), &kv_w_shape).map_err(AttnError::Weight)?;
-    let k_b = bf16_tensor(map, &k_proj_bias_key(layer), &kv_b_shape).map_err(AttnError::Weight)?;
-    let v_w =
-        bf16_tensor(map, &v_proj_weight_key(layer), &kv_w_shape).map_err(AttnError::Weight)?;
-    let v_b = bf16_tensor(map, &v_proj_bias_key(layer), &kv_b_shape).map_err(AttnError::Weight)?;
-    let o_w = bf16_tensor(map, &o_proj_weight_key(layer), &o_w_shape).map_err(AttnError::Weight)?;
-
-    gemv_bf16(&mut work.q, q_w.bytes, proj_in, dims.q_dim, dims.hidden)
-        .map_err(|_| AttnError::Shape)?;
-    add_bf16_bias(&mut work.q, q_b.bytes).map_err(|_| AttnError::Shape)?;
-    gemv_bf16(&mut work.k, k_w.bytes, proj_in, dims.kv_dim, dims.hidden)
-        .map_err(|_| AttnError::Shape)?;
-    add_bf16_bias(&mut work.k, k_b.bytes).map_err(|_| AttnError::Shape)?;
-    gemv_bf16(&mut work.v, v_w.bytes, proj_in, dims.kv_dim, dims.hidden)
-        .map_err(|_| AttnError::Shape)?;
-    add_bf16_bias(&mut work.v, v_b.bytes).map_err(|_| AttnError::Shape)?;
+    // Q, K, and V share `proj_in`. One wave, then each bias. The bias add
+    // stays outside the dot. `work.q` / `k` / `v` are exactly the projection
+    // widths, so the fused segments are those whole buffers.
+    {
+        let mut proj = [
+            GemvOut {
+                y: &mut work.q,
+                w: q_w,
+            },
+            GemvOut {
+                y: &mut work.k,
+                w: k_w,
+            },
+            GemvOut {
+                y: &mut work.v,
+                w: v_w,
+            },
+        ];
+        gemv_bf16_same_x(&mut proj, proj_in).map_err(|_| AttnError::Shape)?;
+    }
+    add_bf16_bias(&mut work.q, q_b).map_err(|_| AttnError::Shape)?;
+    add_bf16_bias(&mut work.k, k_b).map_err(|_| AttnError::Shape)?;
+    add_bf16_bias(&mut work.v, v_b).map_err(|_| AttnError::Shape)?;
 
     rope_f32_inplace(&mut work.q, pos_u32, dims.head_dim, shape.rope_theta)
         .map_err(|_| AttnError::Shape)?;
@@ -296,14 +355,8 @@ pub fn attention_layer(
         GqaMask::Full,
     )
     .map_err(|_| AttnError::Shape)?;
-    gemv_bf16(
-        &mut work.proj,
-        o_w.bytes,
-        &work.att,
-        dims.hidden,
-        dims.q_dim,
-    )
-    .map_err(|_| AttnError::Shape)?;
+    gemv_bf16(&mut work.proj, o_w, &work.att, dims.hidden, dims.q_dim)
+        .map_err(|_| AttnError::Shape)?;
 
     cache
         .store(layer, &work.k, &work.v)

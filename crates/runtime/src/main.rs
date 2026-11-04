@@ -29,6 +29,8 @@
 //! `MYOS_GEMV_PACK=1` packs each 32-row K-tile into column-major scratch.
 //! That pack stays off unless the variable is set. Software prefetch of the
 //! weight stream stays off (knife 9). `MYOS_GEMV_PREFETCH=1` turns it back on.
+//! Decode Q/K/V and gate/up each share one GEMV wave (knife 11). That path
+//! is always on. It is not an environment switch.
 mod arena;
 mod fingerprint;
 mod meter;
@@ -596,7 +598,7 @@ impl From<WeightError> for WeightsError {
 }
 
 fn showdown_id(threads: usize) -> String {
-    format!("s1-myos-bf16-t{threads}-k9")
+    format!("s1-myos-bf16-t{threads}-k11")
 }
 
 fn write_cli_fingerprint(

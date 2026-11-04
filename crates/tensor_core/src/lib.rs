@@ -34,6 +34,9 @@
 //! division form of SiLU, and a left-to-right multiply. No second dtype.
 //! [`gemv_bf16`] may walk several rows in one pass. Each row is still one
 //! left-to-right f32 chain (`acc += w * x`, not a fused multiply-add).
+//! [`gemv_bf16_same_x`] runs several of those GEMVs on one shared `x` in
+//! one worker wave (decode Q/K/V, and gate/up). It does not change the
+//! per-row chain, the row panel, or the register block.
 //! Feature `std` (enabled by the host runtime) partitions those rows across
 //! [`gemv_bf16_threads`] workers. The showdown default is [`SHOWDOWN_THREADS`]
 //! (8). Workers do not reduce across rows. Panel pack stays off unless
@@ -52,8 +55,9 @@ mod gqa;
 mod rope;
 mod swiglu;
 pub use bf16::{
-    add_bf16_bias, bf16_le_to_f32, embed_gather_bf16, gemv_bf16, rmsnorm_bf16_weight, rmsnorm_f32,
-    Bf16OpError, ACC_PATH, QUANT_OR_DTYPE, RMS_NORM_EPS_QWEN25,
+    add_bf16_bias, bf16_le_to_f32, embed_gather_bf16, gemv_bf16, gemv_bf16_same_x,
+    rmsnorm_bf16_weight, rmsnorm_f32, Bf16OpError, GemvOut, ACC_PATH, QUANT_OR_DTYPE,
+    RMS_NORM_EPS_QWEN25,
 };
 pub use gemm_bf16::{gemm_bf16, gemm_bf16_scratch_elems, GEMM_ROW_BLOCK};
 pub use gemv_bf16_kernel::{
