@@ -13,9 +13,11 @@
 //! K-tile from row-major mmap order into a column-major BF16 scratch, then
 //! dots that scratch. The scratch is one tile, not a second copy of the
 //! matrix. Default is off: on the measured host the extra pass was slower
-//! than this strided kernel, and it did not reach 2×. Software prefetch of
-//! the next column group stays on unless [`set_gemv_bf16_prefetch`] is
-//! passed `false`.
+//! than this strided kernel, and it did not reach 2×. Knife 9 also leaves
+//! software prefetch off ([`set_gemv_bf16_prefetch`]). With several workers
+//! each walking its own rows, the extra `_mm_prefetch` competed with the
+//! hardware prefetcher and cut multi-thread throughput. `MYOS_GEMV_PREFETCH=1`
+//! turns that prefetch back on.
 //!
 //! Row-parallel workers live outside this file. They call [`gemv_bf16_rows`]
 //! on a contiguous span from [`gemv_row_spans`]. A span does not share an
@@ -36,8 +38,9 @@ const ROW_PANEL: usize = 32;
 
 /// Off by default. See the module docs.
 static PANEL_PACK: AtomicBool = AtomicBool::new(false);
-/// On by default. The prefetches are the ones already in the strided kernel.
-static PREFETCH: AtomicBool = AtomicBool::new(true);
+/// Off by default (knife 9). The strided kernel can still prefetch when
+/// [`set_gemv_bf16_prefetch`] is set.
+static PREFETCH: AtomicBool = AtomicBool::new(false);
 /// Workers for the next [`crate::gemv_bf16`] call. The host sets this from
 /// `--threads`. Default is the showdown width, not 1.
 static GEMV_THREADS: AtomicUsize = AtomicUsize::new(SHOWDOWN_THREADS);
@@ -50,7 +53,7 @@ pub fn set_gemv_bf16_panel_pack(enabled: bool) {
     PANEL_PACK.store(enabled, Ordering::Relaxed);
 }
 
-/// `false` skips `_mm_prefetch` in the BF16 GEMV. Default is `true`.
+/// `true` enables `_mm_prefetch` in the BF16 GEMV. Default is `false`.
 pub fn set_gemv_bf16_prefetch(enabled: bool) {
     PREFETCH.store(enabled, Ordering::Relaxed);
 }
@@ -904,7 +907,7 @@ mod tests {
         let mut y = vec![1.0f32; 40];
         gemv_bf16(&mut y, &w, &x, 40, 100).unwrap();
         set_gemv_bf16_panel_pack(false);
-        set_gemv_bf16_prefetch(true);
+        set_gemv_bf16_prefetch(false);
         assert_same_bits(&y, &y_naive);
     }
 

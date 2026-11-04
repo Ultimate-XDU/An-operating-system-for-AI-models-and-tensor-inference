@@ -27,8 +27,8 @@
 //!
 //! GEMV toggles (default keeps the knife-5 strided kernel):
 //! `MYOS_GEMV_PACK=1` packs each 32-row K-tile into column-major scratch.
-//! That pack stays off unless the variable is set. `MYOS_GEMV_PREFETCH=0`
-//! turns off software prefetch of the weight stream.
+//! That pack stays off unless the variable is set. Software prefetch of the
+//! weight stream stays off (knife 9). `MYOS_GEMV_PREFETCH=1` turns it back on.
 mod arena;
 mod fingerprint;
 mod meter;
@@ -58,7 +58,7 @@ const SMOKE_PROMPT: u32 = 0;
 const USAGE: &str = "myos [--weights PATH] [--block-fixture] [--steps N] [--threads N] [--fingerprint-dir DIR] [--prompt-ids PATH] [--ref-ids PATH] [--arena-s1] [--warmup N] [--repeats N] [--cost-card PATH]";
 
 /// `MYOS_GEMV_PACK` / `MYOS_GEMV_PREFETCH`. Unset leaves the defaults
-/// (pack off, prefetch on).
+/// (pack off, prefetch off).
 fn apply_gemv_toggles() {
     if let Ok(v) = env::var("MYOS_GEMV_PACK") {
         if v == "1" || v.eq_ignore_ascii_case("true") {
@@ -596,7 +596,7 @@ impl From<WeightError> for WeightsError {
 }
 
 fn showdown_id(threads: usize) -> String {
-    format!("s1-myos-bf16-t{threads}-k8")
+    format!("s1-myos-bf16-t{threads}-k9")
 }
 
 fn write_cli_fingerprint(
@@ -862,11 +862,11 @@ mod tests {
         tensor_core::set_gemv_bf16_panel_pack(true);
         let packed = block_fixture_decode(SMOKE_PROMPT, 4).unwrap();
         tensor_core::set_gemv_bf16_panel_pack(false);
-        tensor_core::set_gemv_bf16_prefetch(false);
-        let no_prefetch = block_fixture_decode(SMOKE_PROMPT, 4).unwrap();
         tensor_core::set_gemv_bf16_prefetch(true);
+        let with_prefetch = block_fixture_decode(SMOKE_PROMPT, 4).unwrap();
+        tensor_core::set_gemv_bf16_prefetch(false);
         assert_eq!(packed, baseline);
-        assert_eq!(no_prefetch, baseline);
+        assert_eq!(with_prefetch, baseline);
     }
 
     #[test]
