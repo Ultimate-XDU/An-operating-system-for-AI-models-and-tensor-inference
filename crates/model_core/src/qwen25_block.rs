@@ -7,7 +7,9 @@
 //! follows ember `src/main.rs` only as far as token ids: this module does
 //! not tokenize. Prefill runs the prompt as one chunk (projections and a
 //! causal KV write), not `n_prompt` calls of [`forward_token`]. Decode stays
-//! on [`forward_token`].
+//! one token at a time. [`greedy_decode`] borrows each layer's weight views
+//! once and reuses them across steps. Q/K/V share one GEMV wave and gate/up
+//! share another. Prefill does not use that wave.
 //!
 //! Weights stay little-endian BF16 views from [`crate::qwen25_bf16`]. Promotion
 //! stays inside `tensor_core` (`quant_or_dtype=bf16`, `acc_path=bf16_w_fp32_acc`).
@@ -33,7 +35,7 @@ use tensor_core::{
 };
 use weight_loader::{MmapWeights, WeightMap};
 
-use crate::attn_wire::{attention_layer, AttnError, AttnShape, AttnWorkspace};
+use crate::attn_wire::{attention_from_bytes, AttnError, AttnShape, AttnWorkspace};
 use crate::greedy_token;
 use crate::kv_cache::{KvCache, KvError};
 use crate::qwen25_bf16::{bf16_tensor, QwenBf16Error};
@@ -217,7 +219,215 @@ fn ready(
 ///
 /// The returned slice is `work.logits()` and is valid until the next call that
 /// borrows `work` mutably.
+///
+/// When every tensor is present, the layer byte views are borrowed once and
+/// the block runs from those slices. A missing tensor falls back to a
+/// layer-at-a-time lookup so an earlier layer can still store before the
+/// error, which is what the partial-map tests lock.
 pub fn forward_token<'a>(
+    token: u32,
+    pos: usize,
+    map: &impl WeightMap,
+    shape: BlockShape,
+    cache: &mut KvCache,
+    work: &'a mut BlockWorkspace,
+) -> Result<&'a [f32], BlockError> {
+    if let Ok(loaded) = load_model(map, shape) {
+        return forward_loaded(token, pos, &loaded, shape, cache, work);
+    }
+    forward_lookup(token, pos, map, shape, cache, work)
+}
+
+struct LayerBytes<'a> {
+    input_ln: &'a [u8],
+    q_w: &'a [u8],
+    q_b: &'a [u8],
+    k_w: &'a [u8],
+    k_b: &'a [u8],
+    v_w: &'a [u8],
+    v_b: &'a [u8],
+    o_w: &'a [u8],
+    post_ln: &'a [u8],
+    gate_w: &'a [u8],
+    up_w: &'a [u8],
+    down_w: &'a [u8],
+}
+
+struct ModelBytes<'a> {
+    embed: &'a [u8],
+    vocab: usize,
+    hidden: usize,
+    final_ln: &'a [u8],
+    layers: Vec<LayerBytes<'a>>,
+}
+
+fn load_layer<'a>(
+    map: &'a impl WeightMap,
+    shape: BlockShape,
+    layer: usize,
+) -> Result<LayerBytes<'a>, BlockError> {
+    let hidden = shape.attn.hidden;
+    let q_dim = shape
+        .attn
+        .num_q_heads
+        .checked_mul(shape.attn.head_dim)
+        .ok_or(BlockError::Shape)?;
+    let kv_dim = shape
+        .attn
+        .num_kv_heads
+        .checked_mul(shape.attn.head_dim)
+        .ok_or(BlockError::Shape)?;
+    Ok(LayerBytes {
+        input_ln: bf16_tensor(map, &input_layernorm_key(layer), &[hidden])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        q_w: bf16_tensor(map, &q_proj_weight_key(layer), &[q_dim, hidden])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        q_b: bf16_tensor(map, &q_proj_bias_key(layer), &[q_dim])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        k_w: bf16_tensor(map, &k_proj_weight_key(layer), &[kv_dim, hidden])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        k_b: bf16_tensor(map, &k_proj_bias_key(layer), &[kv_dim])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        v_w: bf16_tensor(map, &v_proj_weight_key(layer), &[kv_dim, hidden])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        v_b: bf16_tensor(map, &v_proj_bias_key(layer), &[kv_dim])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        o_w: bf16_tensor(map, &o_proj_weight_key(layer), &[hidden, q_dim])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        post_ln: bf16_tensor(map, &post_attention_layernorm_key(layer), &[hidden])
+            .map_err(BlockError::Weight)?
+            .bytes,
+        gate_w: bf16_tensor(
+            map,
+            &gate_proj_weight_key(layer),
+            &[shape.intermediate, hidden],
+        )
+        .map_err(BlockError::Weight)?
+        .bytes,
+        up_w: bf16_tensor(
+            map,
+            &up_proj_weight_key(layer),
+            &[shape.intermediate, hidden],
+        )
+        .map_err(BlockError::Weight)?
+        .bytes,
+        down_w: bf16_tensor(
+            map,
+            &down_proj_weight_key(layer),
+            &[hidden, shape.intermediate],
+        )
+        .map_err(BlockError::Weight)?
+        .bytes,
+    })
+}
+
+fn load_model<'a>(
+    map: &'a impl WeightMap,
+    shape: BlockShape,
+) -> Result<ModelBytes<'a>, BlockError> {
+    let hidden = shape.attn.hidden;
+    let embed =
+        bf16_tensor(map, EMBED_TOKENS, &[shape.vocab, hidden]).map_err(BlockError::Weight)?;
+    let final_ln = bf16_tensor(map, FINAL_NORM, &[hidden]).map_err(BlockError::Weight)?;
+    let mut layers = Vec::with_capacity(shape.num_layers);
+    for layer in 0..shape.num_layers {
+        layers.push(load_layer(map, shape, layer)?);
+    }
+    Ok(ModelBytes {
+        embed: embed.bytes,
+        vocab: shape.vocab,
+        hidden,
+        final_ln: final_ln.bytes,
+        layers,
+    })
+}
+
+fn apply_layer(
+    work: &mut BlockWorkspace,
+    cache: &mut KvCache,
+    layer: usize,
+    pos: usize,
+    shape: BlockShape,
+    bytes: &LayerBytes<'_>,
+) -> Result<(), BlockError> {
+    let hidden = shape.attn.hidden;
+    rmsnorm_bf16_weight(&mut work.normed, bytes.input_ln, &work.x, shape.rms_eps)
+        .map_err(map_op)?;
+    attention_from_bytes(
+        &mut work.x,
+        &work.normed,
+        bytes.q_w,
+        bytes.q_b,
+        bytes.k_w,
+        bytes.k_b,
+        bytes.v_w,
+        bytes.v_b,
+        bytes.o_w,
+        layer,
+        pos,
+        shape.attn,
+        cache,
+        &mut work.attn,
+    )
+    .map_err(BlockError::Attn)?;
+    rmsnorm_bf16_weight(&mut work.normed, bytes.post_ln, &work.x, shape.rms_eps).map_err(map_op)?;
+    swiglu_bf16(
+        &mut work.mlp,
+        &work.normed,
+        bytes.gate_w,
+        bytes.up_w,
+        bytes.down_w,
+        &mut work.gate,
+        &mut work.up,
+        &mut work.act,
+        SwigluShape {
+            hidden,
+            intermediate: shape.intermediate,
+        },
+    )
+    .map_err(|_| BlockError::Shape)?;
+    add_assign(&mut work.x, &work.mlp);
+    Ok(())
+}
+
+fn forward_loaded<'a>(
+    token: u32,
+    pos: usize,
+    loaded: &ModelBytes<'_>,
+    shape: BlockShape,
+    cache: &mut KvCache,
+    work: &'a mut BlockWorkspace,
+) -> Result<&'a [f32], BlockError> {
+    ready(shape, cache, work, pos)?;
+    let embed_shape = [loaded.vocab, loaded.hidden];
+    embed_gather_bf16(&mut work.x, loaded.embed, &embed_shape, token).map_err(map_op)?;
+    for (layer, bytes) in loaded.layers.iter().enumerate() {
+        apply_layer(work, cache, layer, pos, shape, bytes)?;
+    }
+    rmsnorm_bf16_weight(&mut work.normed, loaded.final_ln, &work.x, shape.rms_eps)
+        .map_err(map_op)?;
+    // Tied head: same bytes as the embedding gather. No `lm_head` key.
+    gemv_bf16(
+        &mut work.logits,
+        loaded.embed,
+        &work.normed,
+        loaded.vocab,
+        loaded.hidden,
+    )
+    .map_err(map_op)?;
+    cache.advance().map_err(BlockError::Cache)?;
+    Ok(&work.logits)
+}
+
+fn forward_lookup<'a>(
     token: u32,
     pos: usize,
     map: &impl WeightMap,
@@ -230,67 +440,13 @@ pub fn forward_token<'a>(
     let embed =
         bf16_tensor(map, EMBED_TOKENS, &[shape.vocab, hidden]).map_err(BlockError::Weight)?;
     embed_gather_bf16(&mut work.x, embed.bytes, embed.shape, token).map_err(map_op)?;
-
     for layer in 0..shape.num_layers {
-        let ln =
-            bf16_tensor(map, &input_layernorm_key(layer), &[hidden]).map_err(BlockError::Weight)?;
-        rmsnorm_bf16_weight(&mut work.normed, ln.bytes, &work.x, shape.rms_eps).map_err(map_op)?;
-        attention_layer(
-            &mut work.x,
-            &work.normed,
-            map,
-            layer,
-            pos,
-            shape.attn,
-            cache,
-            &mut work.attn,
-        )
-        .map_err(BlockError::Attn)?;
-
-        let post = bf16_tensor(map, &post_attention_layernorm_key(layer), &[hidden])
-            .map_err(BlockError::Weight)?;
-        rmsnorm_bf16_weight(&mut work.normed, post.bytes, &work.x, shape.rms_eps)
-            .map_err(map_op)?;
-        let gate_w = bf16_tensor(
-            map,
-            &gate_proj_weight_key(layer),
-            &[shape.intermediate, hidden],
-        )
-        .map_err(BlockError::Weight)?;
-        let up_w = bf16_tensor(
-            map,
-            &up_proj_weight_key(layer),
-            &[shape.intermediate, hidden],
-        )
-        .map_err(BlockError::Weight)?;
-        let down_w = bf16_tensor(
-            map,
-            &down_proj_weight_key(layer),
-            &[hidden, shape.intermediate],
-        )
-        .map_err(BlockError::Weight)?;
-        swiglu_bf16(
-            &mut work.mlp,
-            &work.normed,
-            gate_w.bytes,
-            up_w.bytes,
-            down_w.bytes,
-            &mut work.gate,
-            &mut work.up,
-            &mut work.act,
-            SwigluShape {
-                hidden,
-                intermediate: shape.intermediate,
-            },
-        )
-        .map_err(|_| BlockError::Shape)?;
-        add_assign(&mut work.x, &work.mlp);
+        let bytes = load_layer(map, shape, layer)?;
+        apply_layer(work, cache, layer, pos, shape, &bytes)?;
     }
-
     let final_ln = bf16_tensor(map, FINAL_NORM, &[hidden]).map_err(BlockError::Weight)?;
     rmsnorm_bf16_weight(&mut work.normed, final_ln.bytes, &work.x, shape.rms_eps)
         .map_err(map_op)?;
-    // Tied head: same bytes as the embedding gather. No `lm_head` key.
     gemv_bf16(
         &mut work.logits,
         embed.bytes,
@@ -759,9 +915,13 @@ fn attend_chunk(
 
 /// Greedy-decode `steps` tokens from the logits already in `work`.
 ///
-/// Each chosen id is appended to `out` only after its [`forward_token`]
+/// Each chosen id is appended to `out` only after that token's forward
 /// succeeds. The next position is `cache.len()` (the prompt length, after
 /// [`prefill`]). This does not advance the cache a second time.
+///
+/// On a complete map the layer views are borrowed once and reused for every
+/// step (same bytes, no second scan of the weight index). A missing tensor
+/// falls back to [`forward_token`] so a partial layer store still happens.
 pub fn greedy_decode(
     steps: usize,
     map: &impl WeightMap,
@@ -770,6 +930,15 @@ pub fn greedy_decode(
     work: &mut BlockWorkspace,
     out: &mut Vec<u32>,
 ) -> Result<(), BlockError> {
+    if let Ok(loaded) = load_model(map, shape) {
+        for _ in 0..steps {
+            let token = greedy_token(&work.logits);
+            let pos = cache.len();
+            forward_loaded(token, pos, &loaded, shape, cache, work)?;
+            out.push(token);
+        }
+        return Ok(());
+    }
     for _ in 0..steps {
         let token = greedy_token(&work.logits);
         let pos = cache.len();

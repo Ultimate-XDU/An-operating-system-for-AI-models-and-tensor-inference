@@ -34,32 +34,45 @@
 | M_peak | 2963.469 | 3050.953 | 0.9713 | T（合成按协议） |
 | 场景 | — | — | 加权 −80 | L |
 
-## ② 刀⑪ · 跳出 GEMV 行块同族（一口）
+## ② 刀⑪ · 多投影融合已落地（端到端 UNMEASURED）
 
-**目标**：在刀⑨基线上，一口做**更大块** decode 粗改——优先**层内/跨步权重复用**或**多投影融合**（刀⑩未落地的粗条），把 T_decode 推进协议平带，从而场景加权 **优于 −80**。禁止再切行宽 / 预取 / pack。
+一口，默认开，没有加速开关（没有 `MYOS_FUSE` 一类回退）。pack 仍默认关，软件预取仍默认关（`MYOS_GEMV_PREFETCH=1` 才开）。行宽和寄存器块宽不动。乘加序不动：每行仍是 `j = 0..k-1` 先乘后加，非 FMA，无跨行归约。对照基线是刀⑨ host 中位 **T_decode 15.4880**（指纹 `s1-myos-bf16-t8-k9`），禁止用刀⑩的 11.8074 当对照。
 
 ### 改动面
 
-- 层内或跨 decode 步的权重复用；或多投影（如 Q/K/V 或 gate/up）同权重视图融合 / 一次加载多算
-- 仍 BF16+fp32 acc、先乘后加、`threads=8`、`MYOS_GEMV_PACK` 默认关、预取默认关
-- prefill 保持刀⑧ chunk；不回退串行 `forward_token`×n_prompt
+1. **多投影融合。** Decode 的 Q、K、V 共用同一次激活，一次 worker 波算完再加 bias。gate 与 up 同样：一次波，然后 SiLU，down 仍是下一次 GEMV（它读的是 `silu(gate)*up`）。每个 worker 先走自己那一段第一张矩阵的行，再走下一张，中间不 join。数值核仍是刀⑨那份按行的 BF16→f32 点积。
+2. **`greedy_decode` 权重视图复用。** 在完整权重上把每一层的 BF16 视图借一次，后面的 step 复用这些切片，不再逐步重查名字。字节仍按步从映射里流过，不复制成 f32，也不 pack。缺张量时退回逐层查找，以便较早的层仍能按原错误路径写入 KV。
 
-### 硬验收
+Prefill 保持刀⑧的整段 chunk（`gemm_bf16`），不走这条 decode 波。仍 BF16+fp32 acc、`threads=8`、`MYOS_GEMV_PACK` 默认关。
 
-- S1 CORRECT + DET @ `threads=8`
-- T_decode ≥ **16.42** tok/s（期望 L_TPOT ≤ 60.92）**或** 至少 T_decode ≥ **16.37** 且场景加权 **优于 −80**
-- L_TTFT ≤ **2193.6** ms（刀⑨×1.10）
-- **相对刀⑨不回退**（T_decode ≥ 15.4880）
-- 指纹另开：`runs/s1-myos-bf16-t8-k11/`；更新 cost-card / scoreboard
-- **不要求**本刀场景胜 / 开 S2 / Q4；硬门过则要求加权优于 −80
+### 硬门（host 补测；本环境无 1.5B 权重）
+
+| 硬门 | 门槛 |
+|------|------|
+| CORRECT / DET | PASS @ threads=8 |
+| T_decode | ≥16.42，或（≥16.37 且场景加权严格优于 −80） |
+| L_TTFT | ≤2193.6 |
+| 相对刀⑨不回退 | T_decode ≥ **15.4880** |
+
+指纹目录：`runs/s1-myos-bf16-t8-k11/`。账本草稿：`arena/s1-myos-bf16-t8-k11-cost-card.md`。端到端 S1 在写这份草稿的环境里是 **UNMEASURED**。上表没有填实测中位。不要求本刀场景胜或开 S2 / Q4；硬门过则要求加权优于 −80。
+
+### 微基准（不是 S1）
+
+`cargo test -p tensor_core --release release_same_x`，本机 release，threads=8，权重反复打在同一块缓冲上（热缓存，不是 mmap 冷流）。两次：
+
+| 组 | 形状 | separate / fused |
+|----|------|------------------|
+| Q/K/V | `[1536,1536]` + `[256,1536]` + `[256,1536]` | 1.185，1.164 |
+| gate/up | 两个 `[8960,1536]` | 1.132，1.137 |
+
+比值大于 1 表示融合波更短。这组数不能乘到 15.4880 上当成端到端 tok/s。S1 的权重大约 2.8GiB，不会整段留在缓存里。
 
 ### 不做
 
 - 再切 GEMV 行宽 / 寄存器块宽；预取/pack 开关微刀；单算子微刀；只调 threads；打乱乘加序；开 S2/Q4
+- 用刀⑩ 11.8074 当改善基线
 
-### 交付
-
-- 一块 PR；host 补测同形：
+### host 补测
 
 ```bash
 cargo build -p myos_runtime --release
@@ -75,3 +88,5 @@ cargo build -p myos_runtime --release
   --fingerprint-dir runs/s1-myos-bf16-t8-k11 \
   --cost-card arena/s1-myos-bf16-t8-k11-cost-card.md
 ```
+
+硬门在 host 填中位之后再判。不在本刀开 S2 / Q4。

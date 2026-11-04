@@ -18,18 +18,42 @@ use std::thread::{self, JoinHandle};
 use crate::gemv_bf16_kernel::gemv_bf16_rows;
 use crate::gemv_row_spans;
 
-struct Task {
+/// One contiguous row span of one matrix. `rows == 0` is a hole (this
+/// worker has no rows of that segment) and is skipped.
+#[derive(Clone, Copy)]
+struct Piece {
     y: *mut f32,
-    rows: usize,
     w: *const u8,
+    rows: usize,
+}
+
+/// Upper bound on projections that share one `x` in a single worker wave.
+/// Q/K/V is 3 and gate/up is 2. A longer list falls back to one wave per
+/// matrix inside [`crate::gemv_bf16_same_x`].
+pub(crate) const GEMV_FUSED_MAX: usize = 8;
+
+struct Task {
+    pieces: [Piece; GEMV_FUSED_MAX],
+    n: u8,
     x: *const f32,
     k: usize,
     done: Arc<Done>,
 }
 
-// The caller keeps `y`/`w`/`x` alive until `Done` reaches zero, and each
-// task writes a disjoint row span. `x` is only read.
+// The caller keeps every `y`/`w` and `x` alive until `Done` reaches zero.
+// Pieces in one task are disjoint writes. Pieces across tasks of one call
+// are disjoint row spans. `x` and every `w` are only read.
 unsafe impl Send for Task {}
+
+/// Borrowed segment for [`gemv_bf16_same_x_parallel`]. `y` is `rows` f32s
+/// and `w` is `rows * x.len() * 2` bytes. Segments of one call must not
+/// alias `y`.
+#[derive(Clone, Copy)]
+pub(crate) struct SegPtr {
+    pub y: *mut f32,
+    pub w: *const u8,
+    pub rows: usize,
+}
 
 struct Done {
     left: AtomicUsize,
@@ -96,15 +120,30 @@ fn worker_loop(rx: Receiver<Task>) {
 
 /// # Safety
 ///
-/// `task.y` is `rows` exclusive f32s, `task.w` is `rows * k * 2` readable
-/// bytes, and `task.x` is `k` readable f32s. Those ranges stay valid until
-/// this function returns. No other thread writes them.
+/// For each piece with `rows > 0`, `y` is `rows` exclusive f32s and `w` is
+/// `rows * k * 2` readable bytes. `task.x` is `k` readable f32s. Those
+/// ranges stay valid until this function returns. No other thread writes
+/// the same `y` lanes. `k > 0`.
 unsafe fn run_task(task: &Task) {
-    let y = std::slice::from_raw_parts_mut(task.y, task.rows);
-    let nbytes = task.rows.saturating_mul(task.k).saturating_mul(2);
-    let w = std::slice::from_raw_parts(task.w, nbytes);
     let x = std::slice::from_raw_parts(task.x, task.k);
-    gemv_bf16_rows(y, w, x);
+    let n = task.n as usize;
+    for piece in task.pieces.iter().take(n) {
+        if piece.rows == 0 {
+            continue;
+        }
+        let y = std::slice::from_raw_parts_mut(piece.y, piece.rows);
+        let nbytes = piece.rows.saturating_mul(task.k).saturating_mul(2);
+        let w = std::slice::from_raw_parts(piece.w, nbytes);
+        gemv_bf16_rows(y, w, x);
+    }
+}
+
+fn blank_pieces() -> [Piece; GEMV_FUSED_MAX] {
+    [Piece {
+        y: core::ptr::null_mut(),
+        w: core::ptr::null(),
+        rows: 0,
+    }; GEMV_FUSED_MAX]
 }
 
 fn with_senders<R>(workers: usize, body: impl FnOnce(&[Sender<Task>]) -> R) -> R {
@@ -157,10 +196,15 @@ pub(crate) fn gemv_bf16_rows_parallel(y: &mut [f32], w: &[u8], x: &[f32], thread
     with_senders(workers, |txs| {
         for (worker, &(start, end)) in slice.iter().skip(1).enumerate() {
             let rows = end - start;
-            let task = Task {
+            let mut pieces = blank_pieces();
+            pieces[0] = Piece {
                 y: unsafe { y_ptr.add(start) },
-                rows,
                 w: unsafe { w_ptr.add(start * row_bytes) },
+                rows,
+            };
+            let task = Task {
+                pieces,
+                n: 1,
                 x: x_ptr,
                 k,
                 done: Arc::clone(&done),
@@ -171,15 +215,112 @@ pub(crate) fn gemv_bf16_rows_parallel(y: &mut [f32], w: &[u8], x: &[f32], thread
         }
         let (start, end) = slice[0];
         let rows = end - start;
+        let mut pieces = blank_pieces();
+        pieces[0] = Piece {
+            y: unsafe { y_ptr.add(start) },
+            w: unsafe { w_ptr.add(start * row_bytes) },
+            rows,
+        };
         unsafe {
             run_task(&Task {
-                y: y_ptr.add(start),
-                rows,
-                w: w_ptr.add(start * row_bytes),
+                pieces,
+                n: 1,
                 x: x_ptr,
                 k,
                 done: Arc::clone(&done),
             });
+        }
+        done.wait();
+    });
+    if done.failed.load(Ordering::Acquire) {
+        panic!("gemv worker panicked");
+    }
+}
+
+/// One worker wave over several GEMVs that share `x`.
+///
+/// Worker `t` runs its [`gemv_row_spans`] slice of segment 0, then segment
+/// 1, and so on, and only then joins. Each piece is the knife-9 row kernel:
+/// `j` from `0` to `k - 1`, multiply then add, no cross-row reduction, no
+/// pack, no software prefetch. `x` stays the vector those kernels already
+/// reread from L1; this does not retile rows or the register block.
+///
+/// `segs` is empty, or each `w` is `rows * x.len() * 2` and `x` is non-empty.
+/// `y` ranges in one call are disjoint. `threads <= 1` or a single span
+/// stays on this thread.
+pub(crate) fn gemv_bf16_same_x_parallel(segs: &[SegPtr], x: &[f32], threads: usize) {
+    if segs.is_empty() || x.is_empty() {
+        return;
+    }
+    let k = x.len();
+    let row_bytes = match k.checked_mul(2) {
+        Some(n) => n,
+        None => return,
+    };
+    let mut nspan = 0usize;
+    for seg in segs {
+        nspan = nspan.max(gemv_row_spans(seg.rows, threads).len());
+    }
+    if nspan <= 1 {
+        for seg in segs {
+            if seg.rows == 0 {
+                continue;
+            }
+            unsafe {
+                run_task(&Task {
+                    pieces: {
+                        let mut pieces = blank_pieces();
+                        pieces[0] = Piece {
+                            y: seg.y,
+                            w: seg.w,
+                            rows: seg.rows,
+                        };
+                        pieces
+                    },
+                    n: 1,
+                    x: x.as_ptr(),
+                    k,
+                    done: Arc::new(Done::new(0)),
+                });
+            }
+        }
+        return;
+    }
+    let workers = nspan - 1;
+    let done = Arc::new(Done::new(workers));
+    let x_ptr = x.as_ptr();
+    let build = |worker: usize, done: Arc<Done>| -> Task {
+        let mut pieces = blank_pieces();
+        for (i, seg) in segs.iter().enumerate() {
+            let spans = gemv_row_spans(seg.rows, threads);
+            let slice = spans.as_slice();
+            if worker >= slice.len() {
+                continue;
+            }
+            let (start, end) = slice[worker];
+            pieces[i] = Piece {
+                y: unsafe { seg.y.add(start) },
+                w: unsafe { seg.w.add(start * row_bytes) },
+                rows: end - start,
+            };
+        }
+        Task {
+            pieces,
+            n: segs.len() as u8,
+            x: x_ptr,
+            k,
+            done,
+        }
+    };
+    with_senders(workers, |txs| {
+        for worker in 0..workers {
+            let task = build(worker + 1, Arc::clone(&done));
+            txs[worker]
+                .send(task)
+                .unwrap_or_else(|_| panic!("myos-gemv-{worker} stopped"));
+        }
+        unsafe {
+            run_task(&build(0, Arc::clone(&done)));
         }
         done.wait();
     });

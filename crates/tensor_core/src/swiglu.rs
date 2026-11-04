@@ -21,11 +21,14 @@
 //! is a different projection). For a hidden vector `x`:
 //!
 //! ```text
-//! gate = gemv(gate_proj, x)          // [intermediate, hidden]
-//! up   = gemv(up_proj, x)            // [intermediate, hidden]
-//! h[i] = silu(gate[i]) * up[i]       // left to right, one multiply
-//! y    = gemv(down_proj, h)          // [hidden, intermediate]
+//! gate, up = gemv_same_x(gate_proj, up_proj, x)  // one wave, two matrices
+//! h[i] = silu(gate[i]) * up[i]                   // left to right, one multiply
+//! y    = gemv(down_proj, h)                      // [hidden, intermediate]
 //! ```
+//!
+//! Gate and up are separate weight views. The wave does not pack them and
+//! does not add their rows together. Each row is still its own
+//! left-to-right dot of that row.
 //!
 //! [`silu_f32`] is `z / (1 + expf(-z))`: libm `expf`, then one add, then
 //! one division. That is llama.cpp `ggml_silu_f32` and the real-arithmetic
@@ -203,10 +206,17 @@ pub fn swiglu_bf16(
         return Err(SwigluError::Shape);
     }
     // Lengths match what `gemv_bf16` requires, and `hidden` / `intermediate`
-    // are non-zero, so each call returns `Ok` without taking the `k == 0`
-    // path. Errors inside that op are returned before it stores a row.
-    crate::gemv_bf16(gate, gate_w, x, intermediate, hidden).map_err(|_| SwigluError::Shape)?;
-    crate::gemv_bf16(up, up_w, x, intermediate, hidden).map_err(|_| SwigluError::Shape)?;
+    // are non-zero, so the fused call returns `Ok` without taking the
+    // `k == 0` path. Gate and up share `x`: one worker wave, then SiLU.
+    // Each row is still its own left-to-right chain. Down reads `h`, so it
+    // stays a second GEMV. Errors are returned before a row is stored.
+    {
+        let mut proj = [
+            crate::GemvOut { y: gate, w: gate_w },
+            crate::GemvOut { y: up, w: up_w },
+        ];
+        crate::gemv_bf16_same_x(&mut proj, x).map_err(|_| SwigluError::Shape)?;
+    }
     mul_ltr(h, gate, up);
     crate::gemv_bf16(y, down_w, h, hidden, intermediate).map_err(|_| SwigluError::Shape)?;
     Ok(())

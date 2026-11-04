@@ -96,6 +96,7 @@ scenario_id S1 is a placeholder; n_prompt, n_gen, and n_ctx are this process, no
 model_id is set only when layout is qwen25_1_5b. \
 threads is the --threads value (showdown default 8, the same n_threads as llama S1 BF16 -t 8). batch is 1. \
 gemv_pack is false unless MYOS_GEMV_PACK=1; knife-6 panel pack is not the default path. \
+Decode fuses Q/K/V into one same-x GEMV and gate/up into one same-x GEMV. greedy_decode borrows those layer views once. Prefill stays one chunk. The row panel is unchanged. \
 quant_or_dtype stays bf16 and acc_path stays bf16_w_fp32_acc (no whole-table f32). \
 This file is not a llama.cpp exact comparison.";
 
@@ -108,6 +109,7 @@ n_ctx is n_prompt + n_gen, the KvCache max_seq for this process. \
 model_id is set only when layout is qwen25_1_5b. \
 threads is the --threads value (showdown default 8, the same n_threads as llama S1 BF16 -t 8). batch is 1. \
 gemv_pack is false unless MYOS_GEMV_PACK=1; knife-6 panel pack is not the default path. \
+Decode fuses Q/K/V into one same-x GEMV and gate/up into one same-x GEMV. greedy_decode borrows those layer views once. Prefill stays one chunk. The row panel is unchanged. \
 quant_or_dtype stays bf16 and acc_path stays bf16_w_fp32_acc (no whole-table f32). \
 --ref-ids prints CORRECT. This fingerprint file is not itself a llama.cpp exact comparison.";
 

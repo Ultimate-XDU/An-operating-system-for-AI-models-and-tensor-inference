@@ -121,6 +121,109 @@ pub(crate) fn gemv_bf16_at_threads(
     Ok(())
 }
 
+/// One output segment of [`gemv_bf16_same_x`].
+///
+/// `y` has one f32 per row. `w` is that many rows of little-endian BF16,
+/// row-major, with `x.len()` columns. Segments in one call must not alias
+/// `y`. `w` is only read.
+pub struct GemvOut<'a> {
+    pub y: &'a mut [f32],
+    pub w: &'a [u8],
+}
+
+/// Several GEMVs that share one `x`, in one worker wave.
+///
+/// This is the decode fusion for projections that read the same activation:
+/// Q/K/V, or gate and up. Each segment is still [`gemv_bf16`]: row `i` is
+/// `acc += bf16_to_f32(W[i, j]) * x[j]` for `j` from `0` to `k - 1`,
+/// multiply then add, not FMA. Workers split rows with the same spans as a
+/// lone GEMV and do not reduce across rows. The row panel and the register
+/// block are unchanged. Pack and software prefetch stay on their own
+/// switches; this function does not turn them on.
+///
+/// A worker walks its span of segment 0, then segment 1, and so on, before
+/// the wave joins. That is the only schedule change: the activation is
+/// still in cache for the next projection, and the pool does not sleep
+/// between those segments.
+///
+/// On [`Bf16OpError`], no `y` is written. `k == 0` fills every `y` with
+/// zero when every `w` is empty, and rejects a non-empty `w`.
+pub fn gemv_bf16_same_x(outs: &mut [GemvOut<'_>], x: &[f32]) -> Result<(), Bf16OpError> {
+    gemv_bf16_same_x_at_threads(outs, x, crate::gemv_bf16_threads())
+}
+
+/// Same contract as [`gemv_bf16_same_x`], with an explicit worker count.
+pub(crate) fn gemv_bf16_same_x_at_threads(
+    outs: &mut [GemvOut<'_>],
+    x: &[f32],
+    threads: usize,
+) -> Result<(), Bf16OpError> {
+    let k = x.len();
+    if k == 0 {
+        for out in outs.iter() {
+            if !out.w.is_empty() {
+                return Err(Bf16OpError::Shape);
+            }
+        }
+        for out in outs.iter_mut() {
+            out.y.fill(0.0);
+        }
+        return Ok(());
+    }
+    for out in outs.iter() {
+        check_gemv_bytes(out.y.len(), out.w.len(), k)?;
+    }
+    dispatch_gemv_bf16_same_x(outs, x, threads);
+    Ok(())
+}
+
+fn check_gemv_bytes(m: usize, w_len: usize, k: usize) -> Result<(), Bf16OpError> {
+    let row_bytes = k.checked_mul(2).ok_or(Bf16OpError::Shape)?;
+    if w_len / row_bytes < m {
+        return Err(Bf16OpError::RowOutOfBounds);
+    }
+    let need = row_bytes.checked_mul(m).ok_or(Bf16OpError::Shape)?;
+    if w_len != need {
+        return Err(Bf16OpError::Shape);
+    }
+    Ok(())
+}
+
+fn dispatch_gemv_bf16_same_x(outs: &mut [GemvOut<'_>], x: &[f32], threads: usize) {
+    #[cfg(any(feature = "std", test))]
+    {
+        use crate::gemv_pool::{
+            gemv_bf16_rows_parallel, gemv_bf16_same_x_parallel, SegPtr, GEMV_FUSED_MAX,
+        };
+        if outs.len() > GEMV_FUSED_MAX {
+            for out in outs.iter_mut() {
+                gemv_bf16_rows_parallel(out.y, out.w, x, threads);
+            }
+            return;
+        }
+        let mut ptrs = [SegPtr {
+            y: core::ptr::null_mut(),
+            w: core::ptr::null(),
+            rows: 0,
+        }; GEMV_FUSED_MAX];
+        for (i, out) in outs.iter_mut().enumerate() {
+            ptrs[i] = SegPtr {
+                y: out.y.as_mut_ptr(),
+                w: out.w.as_ptr(),
+                rows: out.y.len(),
+            };
+        }
+        gemv_bf16_same_x_parallel(&ptrs[..outs.len()], x, threads);
+    }
+    #[cfg(not(any(feature = "std", test)))]
+    {
+        let _ = threads;
+        for out in outs.iter_mut() {
+            crate::gemv_bf16_kernel::gemv_bf16_rows(out.y, out.w, x);
+        }
+    }
+}
+
 fn dispatch_gemv_bf16(y: &mut [f32], w: &[u8], x: &[f32], threads: usize) {
     #[cfg(any(feature = "std", test))]
     {
