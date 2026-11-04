@@ -43,7 +43,7 @@
 
 ## 落地
 
-基线 main 刀⑦ `a92677f1`。本环境没有 1.5B 权重，CORRECT / DET / 中位记 **UNMEASURED**。单测已经把 chunk prefill 和 serial `forward_token` 的 logits、KV 按 f32 bits 对齐。
+基线 main 刀⑦ `a92677f1`。写口径时本环境没有 1.5B 权重。host 中位见文末「③ host 补测结果」。单测已经把 chunk prefill 和 serial `forward_token` 的 logits、KV 按 f32 bits 对齐。
 
 `prefill` 一次吃完整段 prompt。每一层对 chunk 做 Q/K/V/O 与 SwiGLU 的 `gemm_bf16`：权重保持 BF16 视图，不 pack；每个 token 的每一行仍是 `j=0..k-1` 先乘后加，非 FMA。K/V 写入该层后，每个位置调用现有 `gqa_attn_f32`（`GqaMask::Causal`）。tied head 只跑最后一个 prompt token。`greedy_decode` 仍走 `forward_token`，threads=8 行维并行。`MYOS_GEMV_PACK` 默认关。协议 batch 仍是 1。
 
@@ -66,4 +66,23 @@ cargo build -p myos_runtime --release
 
 产物：`runs/s1-myos-bf16-t8-k8/metrics.json`（中位）、`det_evidence.json`、`token_ids.txt`、`tokens.txt`、`cost-card.md`。CORRECT 或 DET 失败时进程退出码 1。
 
-硬门在 host 填中位之后再判，本环境不把 UNMEASURED 写成已经 ≤3000ms 或已经场景胜。门槛是：S1 CORRECT+DET @ threads=8；L_TTFT ≤3000ms 或相对刀⑦ 9092.903ms ≥3×（≲3031ms）；T_decode ≥12.9 tok/s；场景加权和优于 −80。不要求本刀场景胜，不开 S2，不开 Q4。
+写口径时，未测中位不得写成已经 ≤3000ms 或已经场景胜。门槛是：S1 CORRECT+DET @ threads=8；L_TTFT ≤3000ms 或相对刀⑦ 9092.903ms ≥3×（≲3031ms）；T_decode ≥12.9 tok/s；场景加权和优于 −80。不要求本刀场景胜，不开 S2，不开 Q4。host 填完后的逐项判定见文末「③」。
+
+## ③ host 补测结果
+
+host 2026-11-04 ≈07:57–07:59 UTC+8，WALL≈90s。指纹 `s1-myos-bf16-t8-k8`，commit `16afd923`，threads=8，W=3/R=5，`gemv_pack=false`。CORRECT=PASS，DET=PASS，comparable=true，scene=L。
+
+中位（R=5，与 `arena/phase1-scoreboard.md`、`arena/s1-myos-bf16-t8-k8-cost-card.md` 一致）：T_decode 14.9912 tok/s，L_TTFT 2193.653 ms，L_TPOT 66.706 ms，M_peak 2963.520 MiB。相对 llama.cpp b11960 `-t 8`：T_decode 0.8698 L，L_TTFT 3.6073 L，L_TPOT 1.1497 L，M_peak 0.9713 T。场景加权和 −80。
+
+硬闸逐项（刀⑦对照 L_TTFT 9092.903 ms，T_decode 14.3503 tok/s）：
+
+| 闸 | 门槛 | 实测 | 判定 |
+|----|------|------|------|
+| CORRECT | PASS @ threads=8 | PASS | 过 |
+| DET | PASS @ threads=8 | PASS | 过 |
+| L_TTFT 绝对值 | ≤ 3000 ms | 2193.653 | 过 |
+| L_TTFT 相对刀⑦ | ≥ 3×（≲3031 ms） | 9092.903 / 2193.653 ≈ 4.15× | 过 |
+| T_decode | ≥ 12.9 tok/s | 14.9912 | 过 |
+| 场景加权和 | 优于 −80 | 恰好 −80 | 边界。深析判未过，见 `docs/phase1-knife8-verdict-and-knife9.md` |
+
+计分五次 min / median / max（host `metrics.json`；warmup 三轮已丢弃）：T_decode 14.344929 / 14.991241 / 15.608917；L_TTFT 2120.926 / 2193.653 / 2381.134；L_TPOT 64.065945 / 66.705617 / 69.711047；M_peak 2963.429688 / 2963.519531 / 2975.664062。`det_evidence.json`：`ids_identical=true`，lens 均为 128，`first_diff=null`。日志末行 EXIT=0，WALL=90s。不把恰好 −80 写成已经优于门槛，也不开 S2 / Q4，不 pack。

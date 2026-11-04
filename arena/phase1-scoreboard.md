@@ -1,8 +1,8 @@
 # Phase1 Scoreboard（评测账本）
 
 **协议**：`PHASE1-ARENA-PROTOCOL-v0.1.md`  
-**更新**：2026-11-03 · 刀⑦已合 main @ `a92677f1`；刀⑧ Prefill/TTFT 代码落地，中位 UNMEASURED  
-**合入**：刀⑦ PR #39 已在 main。刀⑧ 指纹另开，host 补测前不改刀⑦数字。
+**更新**：2026-11-04 · 刀⑧ host 中位已填（指纹 `s1-myos-bf16-t8-k8`，W=3/R=5）  
+**合入**：刀⑦ PR #39 已在 main。刀⑧ PR #41 深析已条件收口、建议合入，收口后再 squash。host 补测不改刀⑦数字。
 
 ---
 
@@ -13,7 +13,7 @@
 | E0 冻结 | ✅ | v0.1：1.5B / exact / S3=4096 / CPU / ±5% |
 | E1 llama 基线 S1 | 🟡 部分 | 主赛道 BF16+FP16 DET-PASS；副赛道 Q4 DET-FAIL 仅参考 |
 | E2 MyOS exact S1 | ✅ | CORRECT PASS vs BF16 金标准（当时 threads=1） |
-| 主赛道 S1 吞吐对打 | ✅ 可比已落地 | 刀⑦ host W=3/R=5 中位已填。CORRECT/DET PASS；场景 **L**（加权和 -80）。卡：`arena/s1-myos-bf16-cost-card.md`；产物：`runs/s1-myos-bf16-t8/` |
+| 主赛道 S1 吞吐对打 | ✅ 可比已落地 | 刀⑦与刀⑧ host W=3/R=5 中位均已填。刀⑧ CORRECT/DET PASS；L_TTFT 2193.653；场景仍 **L**（加权和 -80，未优于 -80）。卡：刀⑦ `arena/s1-myos-bf16-cost-card.md`；刀⑧ `arena/s1-myos-bf16-t8-k8-cost-card.md` |
 | 副赛道 Q4 对打 | ⬜ 未开 | 协议：不对打直至另议 |
 
 ---
@@ -24,21 +24,21 @@
 |------|--------|-----|---------|----------|-----------|-----------|------------|------|
 | llama.cpp b11960 | `s1-llamacpp-bf16-b11960` | PASS | 金标准 | 17.2348 | 608.110 | 58.022 | 3050.953 | 自转 GGUF BF16；`-t 8`；E2 ref；ratio 分母 |
 | MyOS threads=8（刀⑦） | `s1-myos-bf16-t8` | **PASS** | **PASS** | 14.3503 | 9092.903 | 69.685 | 2963.383 | host 2026-11-03 15:02 UTC+8；`bf16` / `bf16_w_fp32_acc`，batch=1，`gemv_pack=false`；commit `9577e66`。卡：`arena/s1-myos-bf16-cost-card.md`。已合 main @ `a92677f1` |
-| MyOS threads=8（刀⑧ prefill） | `s1-myos-bf16-t8-k8` | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | UNMEASURED | 整段 chunk prefill 已落地；exact 由单测对 serial `forward_token`。本环境无 1.5B 权重。卡：`arena/s1-myos-bf16-t8-k8-cost-card.md`。口径：`docs/phase1-knife7-verdict-and-knife8.md` |
+| MyOS threads=8（刀⑧ prefill） | `s1-myos-bf16-t8-k8` | **PASS** | **PASS** | 14.9912 | 2193.653 | 66.706 | 2963.520 | host 2026-11-04 ≈07:57–07:59 UTC+8，WALL≈90s；`bf16` / `bf16_w_fp32_acc`，batch=1，`gemv_pack=false`；commit `16afd923`。卡：`arena/s1-myos-bf16-t8-k8-cost-card.md`。口径：`docs/phase1-knife7-verdict-and-knife8.md` |
 | MyOS `42acbb39` | `e2-myos-s1` | （单次 greedy） | **PASS** exact 128/128 | — | — | — | — | 历史正确性收口；指纹 threads=1，**不**拿来和 `-t 8` 比吞吐 |
 | llama.cpp b11960 | `s1-llamacpp-fp16-b11960` | PASS | （非 E2 ref） | 18.84 | 841.1 | 53.07 | 6377 | 官方 FP16；并列主赛道参考，非本 E2 金标准 |
 
-胜负列（S1 BF16，MyOS threads=8 vs llama `-t 8`）：
+胜负列（S1 BF16，刀⑧ MyOS threads=8 vs llama `-t 8`）：
 
 | 指标 | MyOS | llama | ratio (MyOS/base) | 判定 |
 |------|------|-------|-------------------|------|
-| T_decode | 14.3503 | 17.2348 | 0.8326 | L |
-| L_TTFT | 9092.903 | 608.110 | 14.9527 | L |
-| L_TPOT | 69.685 | 58.022 | 1.2010 | L |
-| M_peak | 2963.383 | 3050.953 | 0.9713 | T |
-| 场景 | — | — | 加权和 -80 | **L**（CORRECT/DET 均 PASS，吞吐可比；未达 ±5% 胜） |
+| T_decode | 14.9912 | 17.2348 | 0.8698 | L |
+| L_TTFT | 2193.653 | 608.110 | 3.6073 | L |
+| L_TPOT | 66.706 | 58.022 | 1.1497 | L |
+| M_peak | 2963.520 | 3050.953 | 0.9713 | T |
+| 场景 | — | — | 加权和 -80 | **L**（CORRECT/DET 均 PASS，吞吐可比；TTFT 达标，场景分未优于 -80） |
 
-权重：T_decode 0.35 / L_TPOT 0.25 / L_TTFT 0.20 / M_peak 0.20。这不是「已经胜过 llama」的对外句。软记录（GEMV 微基准，不是 S1）：gate/up `[8960, 1536]`，threads=1 → 8 为 3.611×（云端 4 cores）。见 `docs/phase1-knife7-closeout.md`。
+刀⑦对照仍在上表刀⑦行，不因本表改写。权重：T_decode 0.35 / L_TPOT 0.25 / L_TTFT 0.20 / M_peak 0.20。这不是「已经胜过 llama」的对外句，也不把 TTFT 改善写成场景胜。软记录（GEMV 微基准，不是 S1）：gate/up `[8960, 1536]`，threads=1 → 8 为 3.611×（云端 4 cores）。见 `docs/phase1-knife7-closeout.md`。
 
 ---
 
@@ -63,7 +63,6 @@
 
 ## 下一步（协议 §8）
 
-1. 刀⑦已合 main @ `a92677f1`（PR #39）。账本刀⑦行与 `arena/s1-myos-bf16-cost-card.md` 是该收口的 host 中位。
-2. 刀⑧ Prefill/TTFT：整段 prompt 分块 prefill，指纹 `s1-myos-bf16-t8-k8`。本环境 CORRECT/DET/中位 **UNMEASURED**。host `--arena-s1` 补测命令见 `docs/phase1-knife7-verdict-and-knife8.md`。
-3. E1 补 S2/S3/S6 基线（若尚未闭合）
-4. 副赛道保持关闭，除非月星/协议升版
+1. 刀⑦已合 main @ `a92677f1`（PR #39）。账本刀⑦行与 `arena/s1-myos-bf16-cost-card.md` 是该收口的 host 中位。刀⑧补测不改这些数字。
+2. 刀⑧硬闸 L_TTFT / T_decode / CORRECT / DET 已过：L_TTFT 2193.653 ≤ 3000，且相对刀⑦ 9092.903 ≈ 4.15×；T_decode 14.9912 ≥ 12.9；CORRECT=PASS、DET=PASS。场景加权和恰好 −80。口径写的是「优于 −80」；深析判此项未过（TTFT 达标、场景分未改善）。不对外宣称场景改善或场景胜。
+3. 刀⑨口径：`docs/phase1-knife8-verdict-and-knife9.md`。不在本步开 S2/S3/S6，副赛道 Q4 保持关闭。
