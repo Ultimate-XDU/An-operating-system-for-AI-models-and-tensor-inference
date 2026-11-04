@@ -79,3 +79,5 @@ cargo build -p myos_runtime --release
   --fingerprint-dir runs/s1-myos-bf16-t8-k12 \
   --cost-card arena/s1-myos-bf16-t8-k12-cost-card.md
 ```
+
+刀⑫已实测 FAIL，见 knife12-verdict-and-knife13。
