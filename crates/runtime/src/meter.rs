@@ -548,7 +548,7 @@ pub fn render_cost_card(card: &CostCard) -> String {
     out.push_str(&format!("- det consistency: {}\n", card.det));
     out.push_str("\n### 代价拆解\n");
     out.push_str(&format!(
-        "- 算力：decode 仍是 GEMV 行块分给 {} 个 worker。prefill 把整段 prompt 做成一次分块投影（同一权重行乘上 chunk 内每个 token）。每个 (token, 行) 仍是 `j=0..k-1` 先乘后加，非 FMA，无跨行归约，不 pack 权重。软件预取默认关（`MYOS_GEMV_PREFETCH=1` 才开）。\n",
+        "- 算力：decode GEMV 按矩形切行。高而 K 短（gate/up/tied head）仍是 32 行块；长 K 与方阵（down、Q/K/V/O）走 8 行寄存器块（一段 YMM，每次 8 列）。分给 {} 个 worker。prefill 把整段 prompt 做成一次分块投影（同一权重行乘上 chunk 内每个 token）。每个 (token, 行) 仍是 `j=0..k-1` 先乘后加，非 FMA，无跨行归约，不 pack 权重。软件预取默认关（`MYOS_GEMV_PREFETCH=1` 才开）。刀⑩不拨预取/pack 开关。\n",
         card.threads
     ));
     out.push_str("- 内存：`M_peak` 是加载完成后、prefill 与 decode 期间的 VmRSS 峰值。权重保持 BF16 视图，无整表 f32。\n");

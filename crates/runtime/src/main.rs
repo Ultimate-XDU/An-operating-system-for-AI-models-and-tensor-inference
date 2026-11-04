@@ -25,10 +25,13 @@
 //! `t_decode`, `M_peak`). `--arena-s1` repeats that process W=3 then R=5
 //! and writes the cost card. It does not decode in the parent.
 //!
-//! GEMV toggles (default keeps the knife-5 strided kernel):
-//! `MYOS_GEMV_PACK=1` packs each 32-row K-tile into column-major scratch.
-//! That pack stays off unless the variable is set. Software prefetch of the
-//! weight stream stays off (knife 9). `MYOS_GEMV_PREFETCH=1` turns it back on.
+//! GEMV toggles stay at the knife-9 defaults. Knife 10 cuts the decode
+//! row panel by the rectangle: tall short-K GEMVs stay on the 32-row
+//! block; long-K and square projections use an 8-row register block
+//! (multiply then add). `MYOS_GEMV_PACK=1` packs each 32-row
+//! K-tile into column-major scratch and stays off unless set. Software
+//! prefetch stays off. `MYOS_GEMV_PREFETCH=1` turns it back on. Knife 10
+//! does not flip either switch.
 mod arena;
 mod fingerprint;
 mod meter;
@@ -596,7 +599,7 @@ impl From<WeightError> for WeightsError {
 }
 
 fn showdown_id(threads: usize) -> String {
-    format!("s1-myos-bf16-t{threads}-k9")
+    format!("s1-myos-bf16-t{threads}-k10")
 }
 
 fn write_cli_fingerprint(
