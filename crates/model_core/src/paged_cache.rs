@@ -386,10 +386,8 @@ impl PagedCache {
             let src = head * hd;
             let k_at = self.offset(block, layer, PLANE_K, head, slot);
             let v_at = self.offset(block, layer, PLANE_V, head, slot);
-            for d in 0..hd {
-                self.kv[k_at + d] = key[src + d];
-                self.kv[v_at + d] = value[src + d];
-            }
+            self.kv[k_at..k_at + hd].copy_from_slice(&key[src..src + hd]);
+            self.kv[v_at..v_at + hd].copy_from_slice(&value[src..src + hd]);
         }
         Ok(())
     }
@@ -512,7 +510,9 @@ impl PagedCache {
     ///
     /// `seq_len` is the number of logical keys. [`GqaMask::Full`] with
     /// `seq_len = query_pos + 1` is the causal set: keys past that point are
-    /// not loaded. The arithmetic matches [`gqa_attn_f32`].
+    /// not loaded. Each visible page is one block-table lookup and then a
+    /// contiguous slot scan. The dot, the scale, and each output lane's
+    /// left-to-right value sum match [`gqa_attn_f32`].
     pub fn paged_gqa(
         &self,
         req: &PagedReq,
@@ -578,39 +578,117 @@ impl PagedCache {
             return Err(PagedError::Shape);
         }
         let q_per_kv = num_q_heads / kv_heads;
-        for t in 0..seq_len {
-            if key_kept(t, mask) {
-                self.locate(req, t)?;
-            }
+        // Both masks keep a prefix that starts at key 0. Checking the block
+        // table once per page is the same Range as locating every kept token.
+        let visible = visible_prefix(seq_len, mask);
+        let pages = visible.div_ceil(self.shape.block_tokens);
+        if req.blocks.len() < pages {
+            return Err(PagedError::Range);
+        }
+        for logical in 0..pages {
+            self.block_index(req.blocks[logical])?;
         }
         let scale = attn_scale_f32(hd).map_err(|_| PagedError::Shape)?;
         for q_head in 0..num_q_heads {
             let kv_head = q_head / q_per_kv;
             let q_row = &q[q_head * hd..(q_head + 1) * hd];
-            for t in 0..seq_len {
-                if !key_kept(t, mask) {
-                    continue;
-                }
-                let (block, slot) = self.locate(req, t)?;
-                let k_at = self.offset(block, layer, PLANE_K, kv_head, slot);
-                probs[t] = dot_ltr(q_row, &self.kv[k_at..k_at + hd]) * scale;
-            }
+            self.score_prefix(req, layer, kv_head, q_row, &mut probs[..visible], scale);
             softmax_kept(probs, mask);
             let y_row = &mut y[q_head * hd..(q_head + 1) * hd];
-            for (d, out) in y_row.iter_mut().enumerate() {
-                let mut acc = 0.0f32;
-                for (t, prob) in probs.iter().enumerate() {
-                    if !key_kept(t, mask) {
-                        continue;
-                    }
-                    let (block, slot) = self.locate(req, t)?;
-                    let v_at = self.offset(block, layer, PLANE_V, kv_head, slot) + d;
-                    acc += *prob * self.kv[v_at];
-                }
-                *out = acc;
-            }
+            self.mix_prefix(req, layer, kv_head, &probs[..visible], y_row);
         }
         Ok(())
+    }
+
+    /// Dot each visible key in logical order. One block-table lookup per page,
+    /// then the page's K slots, which are contiguous for this head.
+    fn score_prefix(
+        &self,
+        req: &PagedReq,
+        layer: usize,
+        kv_head: usize,
+        q_row: &[f32],
+        probs: &mut [f32],
+        scale: f32,
+    ) {
+        let hd = self.shape.head_dim;
+        let page = self.shape.block_tokens;
+        let mut t = 0;
+        let mut logical = 0;
+        while t < probs.len() {
+            let block = req.blocks[logical] as usize;
+            let n = page.min(probs.len() - t);
+            let base = self.offset(block, layer, PLANE_K, kv_head, 0);
+            for i in 0..n {
+                let k_at = base + i * hd;
+                probs[t] = dot_ltr(q_row, &self.kv[k_at..k_at + hd]) * scale;
+                t += 1;
+            }
+            logical += 1;
+        }
+    }
+
+    /// Value mix. Each output lane is still `acc += prob[t] * v[t, d]` from
+    /// `t` left to right. A lane tile shares one pass over the page so the
+    /// slot's `head_dim` vector is not reloaded once per lane.
+    fn mix_prefix(
+        &self,
+        req: &PagedReq,
+        layer: usize,
+        kv_head: usize,
+        probs: &[f32],
+        y_row: &mut [f32],
+    ) {
+        const TILE: usize = 8;
+        let hd = self.shape.head_dim;
+        let page = self.shape.block_tokens;
+        let seq = probs.len();
+        let mut d0 = 0;
+        while d0 + TILE <= hd {
+            let mut acc = [0.0f32; TILE];
+            let mut t = 0;
+            let mut logical = 0;
+            while t < seq {
+                let block = req.blocks[logical] as usize;
+                let n = page.min(seq - t);
+                let base = self.offset(block, layer, PLANE_V, kv_head, 0) + d0;
+                for i in 0..n {
+                    let p = probs[t];
+                    let v_at = base + i * hd;
+                    acc[0] += p * self.kv[v_at];
+                    acc[1] += p * self.kv[v_at + 1];
+                    acc[2] += p * self.kv[v_at + 2];
+                    acc[3] += p * self.kv[v_at + 3];
+                    acc[4] += p * self.kv[v_at + 4];
+                    acc[5] += p * self.kv[v_at + 5];
+                    acc[6] += p * self.kv[v_at + 6];
+                    acc[7] += p * self.kv[v_at + 7];
+                    t += 1;
+                }
+                logical += 1;
+            }
+            for di in 0..TILE {
+                y_row[d0 + di] = acc[di];
+            }
+            d0 += TILE;
+        }
+        while d0 < hd {
+            let mut acc = 0.0f32;
+            let mut t = 0;
+            let mut logical = 0;
+            while t < seq {
+                let block = req.blocks[logical] as usize;
+                let n = page.min(seq - t);
+                let base = self.offset(block, layer, PLANE_V, kv_head, 0) + d0;
+                for i in 0..n {
+                    acc += probs[t] * self.kv[base + i * hd];
+                    t += 1;
+                }
+                logical += 1;
+            }
+            y_row[d0] = acc;
+            d0 += 1;
+        }
     }
 
     fn seal(&mut self, req: &mut PagedReq, new_len: usize) -> Result<(), PagedError> {
@@ -744,16 +822,32 @@ impl PagedCache {
         let mut node = ROOT;
         let mut matched = 0;
         let mut blocks = Vec::new();
+        let full_pages = tokens.len() / b;
+        if full_pages > 0 {
+            blocks.reserve(full_pages);
+        }
+        // Touch order stays root, then each landed node. A tail shorter than
+        // one page cannot seal, so the walk stops before that lookup.
         let mut touched = Vec::new();
         touched.push(ROOT);
-        while matched < tokens.len() {
-            let first = tokens[matched];
-            let Some(child) = self.nodes[node].children.get(&first).copied() else {
+        while matched + b <= tokens.len() {
+            let rest = &tokens[matched..];
+            let Some(child) = self.nodes[node].children.get(&rest[0]).copied() else {
                 break;
             };
             let edge_len = self.nodes[child].tokens.len();
-            let n_raw = common_prefix(&self.nodes[child].tokens, &tokens[matched..]);
-            let n = n_raw - n_raw % b;
+            // A full edge is one slice compare. A shorter shared prefix still
+            // goes through [`common_prefix`] and the same page floor.
+            let full_edge = edge_len > 0
+                && edge_len % b == 0
+                && rest.len() >= edge_len
+                && self.nodes[child].tokens.as_slice() == &rest[..edge_len];
+            let n = if full_edge {
+                edge_len
+            } else {
+                let n_raw = common_prefix(&self.nodes[child].tokens, rest);
+                n_raw - n_raw % b
+            };
             if n == 0 {
                 break;
             }
@@ -1037,7 +1131,26 @@ impl PagedCache {
 }
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// Keys this mask loads. Both variants keep `0 .. n` and nothing after it.
+fn visible_prefix(seq_len: usize, mask: GqaMask) -> usize {
+    match mask {
+        GqaMask::Full => seq_len,
+        GqaMask::Causal { query_pos } => {
+            if query_pos >= seq_len - 1 {
+                seq_len
+            } else {
+                query_pos + 1
+            }
+        }
+    }
 }
 
 fn key_kept(t: usize, mask: GqaMask) -> bool {
@@ -1925,5 +2038,73 @@ mod tests {
         assert!(paged.free.contains(&bb[0]));
         paged.finish(a).unwrap();
         paged.finish(b).unwrap();
+    }
+
+    #[test]
+    fn paged_mix_matches_gqa_when_the_page_is_tiled() {
+        // head_dim 8 takes the 8-lane value tile; 10 adds the scalar tail.
+        // Lane 0 is the left-to-right 2^24 dot. A reversed reduction would
+        // disagree with `gqa_attn_f32` on these bits.
+        for &(hd, seq, page) in &[(8usize, 2usize, 2usize), (10, 3, 2), (128, 17, 16)] {
+            let kv_heads = 2;
+            let q_heads = 4;
+            let mut paged = PagedCache::new(shape(1, kv_heads, hd, page), 4).unwrap();
+            let tokens: Vec<u32> = (0..seq as u32).collect();
+            let mut req = paged.admit(&tokens).unwrap();
+            let blocks = paged.alloc_blocks(seq.div_ceil(page)).unwrap();
+            paged.attach(&mut req, &blocks);
+            for t in 0..seq {
+                let mut key = vec![0.0f32; kv_heads * hd];
+                let mut value = vec![0.0f32; kv_heads * hd];
+                for head in 0..kv_heads {
+                    let base = head * hd;
+                    if head == 0 {
+                        key[base] = if t == 0 { 16777216.0 } else { 1.0 };
+                        key[base + 1] = 1.0;
+                        key[base + 2] = 1.0;
+                        key[base + 3] = if t == 0 { 1.0 } else { 16777216.0 };
+                        value[base] = if t == 0 { 2.0 } else { 8.0 };
+                    } else {
+                        key[base] = 0.5;
+                        value[base] = 3.0 + t as f32;
+                    }
+                }
+                paged.write(&req, 0, t, &key, &value).unwrap();
+            }
+            let mut q = vec![0.0f32; q_heads * hd];
+            for h in 0..q_heads {
+                q[h * hd] = 1.0;
+                q[h * hd + 1] = 1.0;
+                q[h * hd + 2] = 1.0;
+                q[h * hd + 3] = 1.0;
+            }
+            let mut y = vec![0.0f32; q.len()];
+            let mut probs = vec![0.0f32; seq];
+            paged
+                .paged_gqa(&req, 0, &q, &mut y, &mut probs, q_heads, seq, GqaMask::Full)
+                .unwrap();
+            let packed = kv_heads * seq * hd;
+            let mut y2 = vec![0.0f32; q.len()];
+            let mut probs2 = vec![0.0f32; seq];
+            let mut pk = vec![0.0f32; packed];
+            let mut pv = vec![0.0f32; packed];
+            paged_gqa_via_pack(
+                &paged,
+                &req,
+                0,
+                &q,
+                &mut y2,
+                &mut probs2,
+                q_heads,
+                seq,
+                GqaMask::Full,
+                &mut pk,
+                &mut pv,
+            )
+            .unwrap();
+            assert_eq!(probs, probs2, "hd {hd} seq {seq}");
+            assert_eq!(y, y2, "hd {hd} seq {seq}");
+            paged.finish(req).unwrap();
+        }
     }
 }
