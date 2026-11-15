@@ -9,17 +9,27 @@
 //! block, the final norm, and the tied embedding head, then advances once.
 //! [`prefill`] runs the prompt as one chunk instead of calling `forward_token`
 //! once per prompt id. Decode stays on `forward_token`.
+//! [`PagedCache`] is the paged pool and radix prefix cache. [`paged_prefill`]
+//! and [`paged_decode`] keep the same projections and the same attention
+//! arithmetic; only the KV address changes. The dense cache stays the reference.
 //! The stub calls none of those.
 #![cfg_attr(not(test), no_std)]
 
 pub mod attn_wire;
 pub mod kv_cache;
+pub mod paged_block;
+pub mod paged_cache;
 pub mod qwen25_bf16;
 pub mod qwen25_block;
 pub mod qwen25_layout;
 
 pub use attn_wire::{attention_layer, AttnError, AttnShape, AttnWorkspace};
 pub use kv_cache::{KvCache, KvError, KvShape};
+pub use paged_block::{paged_decode, paged_greedy, paged_prefill, PagedBlockError};
+pub use paged_cache::{
+    BlockId, NodeId, PagedCache, PagedError, PagedReq, PagedShape, PrefixMatch, BLOCK_NONE,
+    BLOCK_TOKENS, PREFILL_CHUNK,
+};
 pub use qwen25_block::{
     block_fixture, fixture_shape, forward_token, greedy_decode, prefill, BlockError, BlockShape,
     BlockWorkspace,

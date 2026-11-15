@@ -124,6 +124,46 @@ impl BlockWorkspace {
     pub fn logits(&self) -> &[f32] {
         &self.logits
     }
+
+    pub(crate) fn max_seq(&self) -> usize {
+        self.attn.max_seq()
+    }
+
+    pub(crate) fn parts(&mut self) -> (BlockScratch<'_>, crate::attn_wire::AttnScratch<'_>) {
+        let BlockWorkspace {
+            x,
+            normed,
+            mlp,
+            gate,
+            up,
+            act,
+            logits,
+            attn,
+            ..
+        } = self;
+        (
+            BlockScratch {
+                x,
+                normed,
+                mlp,
+                gate,
+                up,
+                act,
+                logits,
+            },
+            attn.scratch(),
+        )
+    }
+}
+
+pub(crate) struct BlockScratch<'a> {
+    pub x: &'a mut [f32],
+    pub normed: &'a mut [f32],
+    pub mlp: &'a mut [f32],
+    pub gate: &'a mut [f32],
+    pub up: &'a mut [f32],
+    pub act: &'a mut [f32],
+    pub logits: &'a mut [f32],
 }
 
 /// Failure from [`forward_token`], [`prefill`], or [`greedy_decode`].
@@ -596,7 +636,7 @@ impl PrefillBuf {
     }
 }
 
-fn preflight_weights(
+pub(crate) fn preflight_weights(
     map: &impl WeightMap,
     shape: BlockShape,
     hidden: usize,
@@ -642,7 +682,7 @@ fn preflight_weights(
     Ok(())
 }
 
-fn project(
+pub(crate) fn project(
     y: &mut [f32],
     w: &[u8],
     x: &[f32],
@@ -654,7 +694,7 @@ fn project(
     gemm_bf16(y, w, x, batch, m, k, scratch).map_err(map_op)
 }
 
-fn norm_all(
+pub(crate) fn norm_all(
     dst: &mut [f32],
     src: &[f32],
     gamma: &[u8],
@@ -669,7 +709,7 @@ fn norm_all(
     Ok(())
 }
 
-fn add_tokens(y: &mut [f32], x: &[f32], n: usize, dim: usize) {
+pub(crate) fn add_tokens(y: &mut [f32], x: &[f32], n: usize, dim: usize) {
     for i in 0..n {
         let s = i * dim;
         add_assign(&mut y[s..s + dim], &x[s..s + dim]);
@@ -825,7 +865,10 @@ pub fn block_fixture() -> Result<MmapWeights, BlockError> {
     Ok(map)
 }
 
-fn insert_embed_and_final(map: &mut MmapWeights, shape: BlockShape) -> Result<(), BlockError> {
+pub(crate) fn insert_embed_and_final(
+    map: &mut MmapWeights,
+    shape: BlockShape,
+) -> Result<(), BlockError> {
     let hidden = shape.attn.hidden;
     debug_assert_eq!(hidden, 2);
     debug_assert_eq!(shape.vocab, 4);
@@ -841,10 +884,25 @@ fn insert_embed_and_final(map: &mut MmapWeights, shape: BlockShape) -> Result<()
 
 /// Q bias, V bias, `o_proj`, then gate / up / down. Norms are `[1, 1]`.
 /// Q/K/V weights and K bias are zero, so V stored in the cache is `v_b`.
-fn fill_layer(
+pub(crate) fn fill_layer(
     map: &mut MmapWeights,
     layer: usize,
     q_b: &[f32],
+    v_b: &[f32],
+    o_w: &[f32],
+    gate: &[f32],
+    up: &[f32],
+    down: &[f32],
+) -> Result<(), BlockError> {
+    let kv_dim = fixture_shape().attn.num_kv_heads * fixture_shape().attn.head_dim;
+    fill_layer_kv(map, layer, q_b, &zeros(kv_dim), v_b, o_w, gate, up, down)
+}
+
+pub(crate) fn fill_layer_kv(
+    map: &mut MmapWeights,
+    layer: usize,
+    q_b: &[f32],
+    k_b: &[f32],
     v_b: &[f32],
     o_w: &[f32],
     gate: &[f32],
@@ -879,7 +937,7 @@ fn fill_layer(
         map,
         &crate::qwen25_layout::k_proj_bias_key(layer),
         &[kv_dim],
-        &zeros(kv_dim),
+        k_b,
     )?;
     put(
         map,

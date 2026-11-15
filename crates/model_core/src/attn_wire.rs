@@ -111,6 +111,27 @@ impl AttnWorkspace {
     pub fn max_seq(&self) -> usize {
         self.max_seq
     }
+
+    pub(crate) fn scratch(&mut self) -> AttnScratch<'_> {
+        AttnScratch {
+            q: &mut self.q,
+            k: &mut self.k,
+            v: &mut self.v,
+            att: &mut self.att,
+            proj: &mut self.proj,
+            probs: &mut self.probs,
+        }
+    }
+}
+
+/// Mutable projection scratch for one attention layer.
+pub(crate) struct AttnScratch<'a> {
+    pub q: &'a mut [f32],
+    pub k: &'a mut [f32],
+    pub v: &'a mut [f32],
+    pub att: &'a mut [f32],
+    pub proj: &'a mut [f32],
+    pub probs: &'a mut [f32],
 }
 
 /// Failure from [`attention_layer`].
