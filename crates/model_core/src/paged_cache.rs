@@ -2107,4 +2107,94 @@ mod tests {
             paged.finish(req).unwrap();
         }
     }
+
+    #[test]
+    fn probe_qwen_12_2_128_to_bits() {
+        // Design item 4 at Qwen width: 12 query heads, 2 KV heads, head dim
+        // 128, block 16. The block table is not allocation order. Query head
+        // h reads KV head h / 6. y and probs match gqa_attn_f32 bit for bit.
+        let b = 16usize;
+        let kv_heads = 2usize;
+        let q_heads = 12usize;
+        let dim = 128usize;
+        let seq = 3 * b + 5;
+        let mut paged = PagedCache::new(shape(1, kv_heads, dim, b), 4).unwrap();
+        let tokens: Vec<u32> = (0..seq as u32).collect();
+        let mut req = paged.admit(&tokens).unwrap();
+        let blocks = paged.alloc_blocks(seq.div_ceil(b)).unwrap();
+        assert_eq!(blocks.len(), 4);
+        let scrambled = vec![blocks[2], blocks[0], blocks[3], blocks[1]];
+        assert_ne!(scrambled, blocks);
+        paged.attach(&mut req, &scrambled);
+        assert_eq!(req.blocks(), scrambled.as_slice());
+        for t in 0..seq {
+            let mut key = vec![0.0f32; kv_heads * dim];
+            let mut value = vec![0.0f32; kv_heads * dim];
+            for head in 0..kv_heads {
+                for d in 0..dim {
+                    key[head * dim + d] =
+                        ((t + 1) * (head + 1)) as f32 * 0.01 + (d % 16) as f32 * 0.001;
+                    value[head * dim + d] =
+                        0.25 + head as f32 + (t % 5) as f32 * 0.1 + (d % 8) as f32 * 0.01;
+                }
+            }
+            paged.write(&req, 0, t, &key, &value).unwrap();
+        }
+        let mut q = vec![0.0f32; q_heads * dim];
+        for h in 0..q_heads {
+            let group = h / (q_heads / kv_heads);
+            for d in 0..dim {
+                q[h * dim + d] = (group + 1) as f32 * 0.02
+                    + (h % 6) as f32 * 0.001
+                    + if d == 0 { 1.0 } else { (d % 5) as f32 * 0.0005 };
+            }
+        }
+        let lengths = [1usize, b - 1, b, b + 1, 3 * b, 3 * b + 5];
+        for seq_len in lengths {
+            let queries = [0usize, b - 1, b, seq_len / 2, seq_len - 1];
+            for query_pos in queries {
+                if query_pos >= seq_len {
+                    continue;
+                }
+                let masks = [GqaMask::Full, GqaMask::Causal { query_pos }];
+                for mask in masks {
+                    let mut y = vec![0.0f32; q.len()];
+                    let mut probs = vec![0.0f32; seq_len];
+                    paged
+                        .paged_gqa(&req, 0, &q, &mut y, &mut probs, q_heads, seq_len, mask)
+                        .unwrap();
+                    let packed = kv_heads * seq_len * dim;
+                    let mut pk = vec![0.0f32; packed];
+                    let mut pv = vec![0.0f32; packed];
+                    paged
+                        .pack_logical(&req, 0, seq_len, &mut pk, &mut pv)
+                        .unwrap();
+                    let mut y_ref = vec![0.0f32; q.len()];
+                    let mut probs_ref = vec![0.0f32; seq_len];
+                    gqa_attn_f32(
+                        &mut y_ref,
+                        &q,
+                        &pk,
+                        &pv,
+                        &mut probs_ref,
+                        GqaShape {
+                            num_q_heads: q_heads,
+                            num_kv_heads: kv_heads,
+                            head_dim: dim,
+                            seq_len,
+                        },
+                        mask,
+                    )
+                    .unwrap();
+                    let label = format!("seq {seq_len} query {query_pos} {mask:?}");
+                    for (i, (got, want)) in y.iter().zip(&y_ref).enumerate() {
+                        assert_eq!(got.to_bits(), want.to_bits(), "{label} y[{i}]");
+                    }
+                    for (i, (got, want)) in probs.iter().zip(&probs_ref).enumerate() {
+                        assert_eq!(got.to_bits(), want.to_bits(), "{label} probs[{i}]");
+                    }
+                }
+            }
+        }
+    }
 }
